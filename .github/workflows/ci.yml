@@ -146,6 +146,19 @@ jobs:
             max-userbot:ci \
             python -m pytest -q -p no:cacheprovider
 
+      - name: Check the real transport is inside the image
+        # Тесты этого не поймают: они подменяют библиотеку транспорта фейком,
+        # чтобы адаптер проверялся без сети и без аккаунта, — и остаются
+        # зелёными, даже если настоящей библиотеки в образе нет. А выбирается
+        # транспорт переменной окружения уже после сборки, доставить пакет в
+        # запущенный контейнер нечем. Так что отсутствие всплыло бы у
+        # пользователя при первом же `MAXUB_TRANSPORT=pymax`.
+        run: |
+          docker run --rm \
+            -e MAXUB_DATA_DIR=/tmp/data \
+            max-userbot:ci \
+            python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); print(t.name, t.capabilities.send_text)"
+
   package:
     name: Колесо и статика веб-панели
     runs-on: ubuntu-latest

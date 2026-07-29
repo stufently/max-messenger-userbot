@@ -23,6 +23,7 @@ from maxub.transport.base import (
     Transport,
     TransportAuthError,
     TransportNotApplied,
+    TransportPermanent,
     TransportRateLimited,
 )
 
@@ -149,6 +150,13 @@ class OutboxWorker:
         except TransportAuthError as exc:
             await self._repo.mark_failed(item.id, str(exc))
             await self._on_auth_lost(item.account_id, str(exc))
+            return
+        except TransportPermanent as exc:
+            # Запрос не станет корректным при повторе, и сверять нечего:
+            # сервер его не принял осознанно. Без этой ветки заведомо неверное
+            # сообщение висело бы в sending до ручного разбора наравне с
+            # действительно неоднозначными — и прятало бы их за собой.
+            await self._repo.mark_failed(item.id, str(exc))
             return
         except Exception as exc:
             # Таймаут, обрыв, TransportOutcomeUnknown: сообщение могло уйти.

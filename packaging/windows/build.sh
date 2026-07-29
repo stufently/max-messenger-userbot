@@ -7,9 +7,32 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DOCKERFILE="$REPO_ROOT/packaging/windows/Dockerfile"
+
 # Тег фиксированный и говорит, из чего образ собран: `latest` со временем
-# начинает означать что угодно.
-IMAGE="${MAXUB_WINBUILD_IMAGE:-maxub-winbuild:py3.13.14-wine10}"
+# начинает означать что угодно. Дата в теге — снимок репозитория Debian, из
+# которого приходит системная часть: Wine и его окружение теперь такой же
+# закреплённый вход сборки, как версия Python.
+#
+# Числа для тега вычитываются из Dockerfile, а не пишутся здесь ещё раз. Иначе
+# это два одинаковых значения в разных файлах, обязанных совпадать и ничем не
+# связанных: правка снимка оставила бы тег с прежней датой, и образ называл бы
+# содержимое, которого в нём нет. Мажор Wine в теге не вычисляется — его
+# гарантирует проверка в самом Dockerfile, которая не даст собрать образ с
+# версией ниже.
+dockerfile_arg() {
+    local value
+    value="$(sed -n "s/^ARG $1=//p" "$DOCKERFILE")"
+    if [ -z "$value" ]; then
+        echo "build.sh: в Dockerfile не найден ARG $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+PYTHON_VERSION="$(dockerfile_arg PYTHON_VERSION)"
+DEBIAN_SNAPSHOT="$(dockerfile_arg DEBIAN_SNAPSHOT)"
+IMAGE="${MAXUB_WINBUILD_IMAGE:-maxub-winbuild:py${PYTHON_VERSION}-wine10-deb${DEBIAN_SNAPSHOT%%T*}}"
 DIST_DIR="$REPO_ROOT/dist/windows"
 
 if [ "$(id -u)" -eq 0 ]; then

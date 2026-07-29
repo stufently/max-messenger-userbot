@@ -19,6 +19,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 REPO_ROOT = Path(SPECPATH).resolve().parents[1]  # noqa: F821 — SPECPATH даёт PyInstaller
 SRC_DIR = REPO_ROOT / "src"
 PYPROJECT = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -43,8 +45,16 @@ else:
 # подбирает реализации цикла, протокола и lifespan строкой в рантайме
 # (`uvicorn.loops.auto` и соседние), поэтому анализатор их не видит и без
 # явного перечисления exe падает на старте с ModuleNotFoundError.
-# `uvicorn.protocols.websockets.*` не перечислены: websockets/wsproto в
-# зависимостях нет, авто-выбор корректно отдаёт заглушку.
+# Раньше рядом с `websockets.auto` не стояло ни одной реализации, и это было
+# верно: websockets и wsproto в зависимостях не было, авто-выбор отдавал
+# заглушку, а панель обходилась без сокета. Теперь websockets приезжает
+# транзитивно вместе с транспортом, и `auto` берёт настоящую реализацию.
+# Именно `websockets_sansio_impl`, а не `websockets_impl`: в uvicorn 0.52
+# первая ветка `auto` выбирает sansio, а старый impl остаётся для тех, кто
+# просит его явно. Прописан по той же причине, что и `http.h11_impl` рядом:
+# анализатор доходит до него сам (импорт в `auto` статический, просто внутри
+# `try`), но держать выбор реализации явным дешевле, чем однажды выяснять из
+# отчёта пользователя, что перестал.
 hiddenimports = [
     "uvicorn.lifespan.off",
     "uvicorn.lifespan.on",
@@ -53,6 +63,7 @@ hiddenimports = [
     "uvicorn.protocols.http.auto",
     "uvicorn.protocols.http.h11_impl",
     "uvicorn.protocols.websockets.auto",
+    "uvicorn.protocols.websockets.websockets_sansio_impl",
     "uvicorn.logging",
     # pydantic v2 собирает модели через компилируемое ядро и обращается к
     # `pydantic.deprecated.*` из сгенерированного кода — эти ветки анализатор
@@ -70,6 +81,42 @@ hiddenimports += [
     for path in sorted(TRANSPORT_DIR.glob("*.py"))
     if path.stem != "__init__"
 ]
+
+# --- библиотека транспорта ---------------------------------------------------
+# Сами модули адаптера выше — это ещё не транспорт: за ними стоит библиотека
+# `maxapi-python` (импортируется как `pymax`), и без неё выбор
+# `MAXUB_TRANSPORT=pymax` в exe упирается в совет «выполните pip install»,
+# который внутри one-file выполнить нечем. В pyproject она объявлена
+# необязательным extra — это верно для установки из PyPI, где заглушка остаётся
+# рабочим режимом, но в собранный exe необязательных зависимостей не бывает:
+# либо лежит сразу, либо не появится никогда.
+#
+# Берётся пакет целиком, а не по следам анализатора. Проверено на собранном
+# exe: анализатор сам дотягивается до 146 модулей из 148 — не хватает
+# `pymax.auth.email` (пустой файл) и `pymax.auth.service` (на неё в библиотеке
+# никто не ссылается), то есть сегодня недостача безвредна. Но зависеть тут от
+# трассировки нельзя: адаптер работает с библиотекой через `Any`, её внутренний
+# API меняется без предупреждения, и достаточно одной ветки, до которой
+# анализатор не дошёл, чтобы exe упал `ModuleNotFoundError` уже у пользователя —
+# в единственном месте, куда нельзя доставить недостающее. Цена полноты — два
+# лишних модуля.
+PYMAX_PACKAGE = "pymax"
+pymax_modules = collect_submodules(PYMAX_PACKAGE)
+if not pymax_modules:
+    # Молчаливая сборка «без транспорта» — ровно та поломка, ради которой этот
+    # блок написан: exe получился бы внешне исправным и бесполезным при первом
+    # же переключении транспорта. Пусть падает здесь, где ещё можно поставить
+    # extra, а не у пользователя.
+    #
+    # Пустой список, а не `try/except`: проверено на PyInstaller 6.21 в самом
+    # сборочном образе — `collect_submodules` для ненайденного пакета возвращает
+    # `[]` и печатает предупреждение, а не бросает `ModuleNotFoundError`.
+    raise SystemExit(
+        f"maxub.spec: библиотека {PYMAX_PACKAGE!r} (пакет maxapi-python) не найдена "
+        "или не импортируется в окружении сборки — поставьте её через extra: "
+        "pip install '.[pymax]'"
+    )
+hiddenimports += pymax_modules
 
 # Ненужное в exe: тянут за собой десятки мегабайт и в юзерботе не участвуют.
 excludes = ["tkinter", "test", "unittest", "pydoc_data", "setuptools", "pip"]

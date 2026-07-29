@@ -226,12 +226,12 @@ class FlakyConnectStub(StubTransport):
         self.failures = 0
         self.connects = 0
 
-    async def connect(self, session: Session) -> None:
+    async def connect(self, session: Session) -> Session | None:
         self.connects += 1
         if self.failures > 0:
             self.failures -= 1
             raise TransportOutcomeUnknown("сеть недоступна")
-        await super().connect(session)
+        return await super().connect(session)
 
 
 async def _login(service: UserbotService, phone: str = "+79990000000") -> int:
@@ -667,3 +667,57 @@ async def test_account_failed_at_startup_keeps_retrying(settings: Settings) -> N
         assert transport.connects >= 4
     finally:
         await restarted.stop()
+
+
+async def test_rotated_token_is_persisted(settings: Settings) -> None:
+    """Новый токен от сервера должен пережить перезапуск демона.
+
+    Раньше `connect` ничего не возвращал: адаптер получал ротацию, а сказать о
+    ней ядру было нечем. В базе оставался прежний токен, и следующий запуск
+    просил войти заново сразу после успешного входа.
+    """
+    transport = StubTransport()
+    service = _service_over(settings, transport)
+    await service.start()
+    try:
+        await _login(service)
+        stored = await service._storage.load_session(1)
+        assert stored is not None
+        before = str(stored["token"])
+
+        # Имитируем ротацию на стороне сервера при переподключении.
+        transport.rotate_token_on_connect = True
+        await service._connections.disconnect(1)
+        await service._connections.connect(1, Session.model_validate(stored))
+
+        refreshed = await service._storage.load_session(1)
+        assert refreshed is not None
+        assert str(refreshed["token"]) != before
+    finally:
+        await service.stop()
+
+
+async def test_rotated_token_on_first_login_is_persisted(settings: Settings) -> None:
+    """Ротация на самом первом подключении после входа тоже должна сохраниться.
+
+    Вход сохраняет сессию сам, уже после подключения, и записывал ту, что
+    передал, — затирая новый токен, полученный на этом же подключении. В памяти
+    оставался новый, в базе старый.
+    """
+    transport = StubTransport()
+    service = _service_over(settings, transport)
+    await service.start()
+    try:
+        account = await service.add_account("+79990000000")
+        challenge_id = await service.start_login(account.id)
+        transport.rotate_token_on_connect = True
+        await service.complete_login(challenge_id, STUB_CODE)
+
+        stored = await service._storage.load_session(account.id)
+        assert stored is not None
+        # Транспорт выдал новый токен вместо того, что пришёл из входа.
+        assert not str(stored["token"]).startswith("stub-out")
+        active = service._connections._sessions[account.id]
+        assert active.token == str(stored["token"])
+    finally:
+        await service.stop()

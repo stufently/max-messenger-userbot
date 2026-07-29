@@ -10,16 +10,18 @@ from __future__ import annotations
 
 from maxub.core.storage.accounts import AccountsMixin
 from maxub.core.storage.base import Database, DuplicateAccountError
-from maxub.core.storage.delivery import DeliveryMixin
 from maxub.core.storage.events import EventsMixin
 from maxub.core.storage.outbox import OutboxMixin
 from maxub.core.storage.penalties import PenaltiesMixin
+from maxub.core.storage.review import ReviewMixin
 
 
 class Storage(
     AccountsMixin,
     OutboxMixin,
-    DeliveryMixin,
+    # Решения человека наследуют обычный жизненный цикл доставки, поэтому
+    # `DeliveryMixin` приходит вместе с ними и отдельно не перечисляется.
+    ReviewMixin,
     PenaltiesMixin,
     EventsMixin,
     Database,

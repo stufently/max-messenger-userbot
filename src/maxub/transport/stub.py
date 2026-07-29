@@ -57,6 +57,8 @@ class StubTransport:
         self.fail_with: Exception | None = None
         #: Заставляет сверку отвечать «выяснить не удалось» — для тестов.
         self.reconcile_inconclusive = False
+        #: Заставляет ближайшее подключение вернуть обновлённую сессию.
+        self.rotate_token_on_connect = False
 
     # --- авторизация --------------------------------------------------------
 
@@ -112,10 +114,16 @@ class StubTransport:
             raise TransportAuthError("неизвестный запрос QR-входа")
         self._qr_challenges[challenge_id] = True
 
-    async def connect(self, session: Session) -> None:
+    async def connect(self, session: Session) -> Session | None:
         if not session.token.startswith("stub-"):
             raise TransportAuthError("сессия не принадлежит заглушечному транспорту")
         self._connected = True
+        if not self.rotate_token_on_connect:
+            return None
+        # Имитация ротации токена сервером: ядро обязано сохранить новую сессию,
+        # иначе следующий запуск придёт со старой и попросит войти заново.
+        self.rotate_token_on_connect = False
+        return session.model_copy(update={"token": f"stub-{secrets.token_hex(8)}"})
 
     async def disconnect(self) -> None:
         self._connected = False

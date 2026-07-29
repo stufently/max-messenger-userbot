@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -127,6 +128,82 @@ def test_retry_of_live_item_exits_conflict(
     item_id = json.loads(capsys.readouterr().out)["item"]["id"]
 
     assert _run_cli(["--json", "retry", "--id", str(item_id)]) == client_module.EXIT_CONFLICT
+
+
+def _login_and_send(capsys: pytest.CaptureFixture[str], phone: str, chat_id: str) -> int:
+    """Доводит аккаунт до готовности и ставит сообщение, возвращая его id."""
+    _run_cli(["--json", "accounts", "add", "--phone", phone])
+    capsys.readouterr()
+
+    _run_cli(["--json", "login", "start", "--account-id", "1"])
+    challenge_id = json.loads(capsys.readouterr().out)["challenge_id"]
+    _run_cli(["--json", "login", "complete", "--challenge-id", challenge_id, "--code", STUB_CODE])
+    capsys.readouterr()
+
+    _run_cli(["--json", "send", "--account-id", "1", "--chat-id", chat_id, "--text", "текст"])
+    return int(json.loads(capsys.readouterr().out)["item"]["id"])
+
+
+def _force_failed(db_path: Path, item_id: int) -> None:
+    """Переводит запись в failed мимо демона — как после исчерпанных попыток.
+
+    Через API довести запись до отказа нечем: заглушка транспорта всегда
+    отправляет успешно, а тесту нужен именно тот случай, ради которого команда
+    и существует.
+    """
+    raw = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        raw.execute(
+            "UPDATE outbox SET state = 'failed', error = 'канал занят' WHERE id = ?", (item_id,)
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def test_discard_exits_zero_and_records_reason(
+    api: TestClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Успешный отказ — код 0, а причина видна в машинном выводе."""
+    item_id = _login_and_send(capsys, "+79990000004", "chat-discard-cli")
+    _force_failed(tmp_path / "maxub.db", item_id)
+
+    code = _run_cli(["--json", "discard", "--id", str(item_id), "--reason", "уже не нужно"])
+
+    assert code == client_module.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "discarded"
+    assert payload["discard_reason"] == "уже не нужно"
+
+
+def test_discard_of_missing_item_exits_not_found(api: TestClient) -> None:
+    assert (
+        _run_cli(["--json", "discard", "--id", "424242", "--reason", "нечего отменять"])
+        == client_module.EXIT_NOT_FOUND
+    )
+
+
+def test_discard_of_live_item_exits_conflict(
+    api: TestClient, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Запись, которой распоряжается демон, отменить нельзя — код конфликта."""
+    item_id = _login_and_send(capsys, "+79990000005", "chat-live-cli")
+
+    code = _run_cli(["--json", "discard", "--id", str(item_id), "--reason", "передумал"])
+
+    assert code == client_module.EXIT_CONFLICT
+
+
+def test_discard_with_blank_reason_is_rejected(
+    api: TestClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Строка из пробелов причиной не считается — иначе проверка обходится."""
+    item_id = _login_and_send(capsys, "+79990000006", "chat-blank-cli")
+    _force_failed(tmp_path / "maxub.db", item_id)
+
+    code = _run_cli(["--json", "discard", "--id", str(item_id), "--reason", "   "])
+
+    assert code == client_module.EXIT_USAGE
 
 
 def test_unreachable_daemon_exits_three(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

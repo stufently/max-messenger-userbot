@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from maxub.api.routes.common import (
     MAX_PAGE_SIZE,
     STUCK_PAGE_SIZE,
+    DiscardRequest,
     SendRequest,
     StuckState,
     get_service,
@@ -51,6 +52,10 @@ async def outbox(
     Без ``state`` показываются отказавшие (`failed`) и застрявшие «в полёте»
     (`sending`): только они сами с места не сдвинутся. Ответ содержит ошибку,
     число попыток и время — по ним и принимается решение о повторе.
+
+    Фильтр `discarded` показывает уже разобранное — записи, от которых человек
+    отказался, вместе с причиной отказа. В выдачу без фильтра они не попадают:
+    решение по ним принято, и звать к ним человека второй раз незачем.
     """
     chosen = OutboxState(state.value) if state is not None else None
     return await service.list_stuck_messages(limit=limit, state=chosen)
@@ -71,6 +76,29 @@ async def retry(item_id: int, service: UserbotService = Depends(get_service)) ->
     """
     try:
         return await service.retry_message(item_id)
+    except ServiceNotFound as exc:
+        raise http_error(404, exc) from exc
+    except ServiceError as exc:
+        raise http_error(409, exc) from exc
+
+
+@router.post("/outbox/{item_id}/discard")
+async def discard(
+    item_id: int, payload: DiscardRequest, service: UserbotService = Depends(get_service)
+) -> dict[str, object]:
+    """Отказывается от записи: сообщение не будет отправлено никогда.
+
+    Второй возможный итог разбора рядом с повтором. Решение окончательно:
+    вернуть запись в очередь после отказа нельзя, передумавший ставит новое
+    сообщение. Причина обязательна и сохраняется отдельно от ошибки отправки —
+    та понадобится, когда к записи вернутся позже.
+
+    Отказаться, как и повторить, можно только из состояния `failed`: запись, с
+    которой работает воркер, отменять на ходу нельзя — отправка уже могла уйти в
+    сеть. Такой запрос отвергается конфликтом.
+    """
+    try:
+        return await service.discard_message(item_id, payload.reason)
     except ServiceNotFound as exc:
         raise http_error(404, exc) from exc
     except ServiceError as exc:

@@ -11,6 +11,7 @@ import pytest
 from maxub.config import Settings
 from maxub.core.crypto import SecretBox, SecretError
 from maxub.core.models import OutboxState, Session
+from maxub.core.review import discarded_event
 from maxub.core.service import ServiceError, ServiceNotFound, UserbotService
 from maxub.core.storage import Storage
 from maxub.transport.base import (
@@ -442,6 +443,179 @@ async def test_manual_retry_of_missing_item_is_not_found(service: UserbotService
     """Несуществующая запись — это «не найдено», а не отказ общего вида."""
     with pytest.raises(ServiceNotFound):
         await service.retry_message(424242)
+
+
+async def _refused_without_trace(service: UserbotService, chat_id: str, text: str) -> int:
+    """Доводит сообщение до отказа, не оставив следа на сервере.
+
+    Отличается от [_left_to_human] намеренно: там сообщение всё-таки ушло, и по
+    истории чата не видно, отправляли ли его ещё раз. Здесь история пуста, а
+    транспорт после отказа исправен — значит любая непрошеная отправка сразу
+    видна.
+    """
+    account_id = await login_by_phone(service)
+    transport = service._connections.get(account_id)
+    assert isinstance(transport, StubTransport)
+    transport.fail_sends = 100
+    transport.fail_with = TransportNotApplied("канал занят")
+
+    item, _ = await service.enqueue_message(account_id, chat_id, text)
+    await wait_for(_awaits_state(service, item.id, OutboxState.FAILED))
+    transport.fail_sends = 0
+    return item.id
+
+
+async def test_discarded_item_is_never_sent_and_leaves_a_trail(service: UserbotService) -> None:
+    """Запись, от которой отказались, не уезжает и не зовёт человека второй раз.
+
+    Проверяется вместе: воркер её больше не берёт, в списке ждущих разбора её
+    нет, а причины — и отказа отправки, и решения человека — сохранены обе.
+    """
+    item_id = await _refused_without_trace(service, "chat-discard", "уже не нужно")
+
+    stored = await service.discard_message(item_id, "чат закрыт, отправлять некуда")
+
+    assert stored["state"] == OutboxState.DISCARDED.value
+    assert stored["discard_reason"] == "чат закрыт, отправлять некуда"
+    assert stored["discarded_at"]
+    # Ошибка отправки цела: она объясняет, почему запись вообще попала к
+    # человеку, и решение не должно её затирать.
+    assert "канал занят" in str(stored["error"])
+
+    assert all(r["id"] != item_id for r in await service.list_stuck_messages(limit=50))
+    # Транспорт исправен, и несколько циклов воркера прошли: если бы запись
+    # осталась живой, сообщение появилось бы в чате.
+    await asyncio.sleep(0.3)
+    transport = service._connections.get(1)
+    assert isinstance(transport, StubTransport)
+    assert await transport.fetch_history("chat-discard", 10) == []
+    assert (await service._storage.get_outbox(item_id)) is not None
+
+
+async def test_discard_refuses_live_item(settings: Settings) -> None:
+    """Живую запись у демона не отбирают даже отказом.
+
+    Отмена на ходу опаснее отказа в повторе: отправка могла уже уйти в сеть, а
+    запись при этом объявили бы «решили не отправлять».
+    """
+    settings.retry_base_seconds = 30.0
+    settings.retry_max_seconds = 30.0
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        transport.fail_sends = 100
+        transport.fail_with = TransportNotApplied("канал занят")
+
+        item, _ = await service.enqueue_message(account_id, "chat-live-discard", "живая запись")
+
+        async def parked() -> bool:
+            stored = await service._storage.get_outbox(item.id)
+            return stored is not None and stored.next_attempt_at is not None
+
+        await wait_for(parked)
+
+        with pytest.raises(ServiceError) as excinfo:
+            await service.discard_message(item.id, "передумал")
+        # Конфликт состояния, а не «не найдено»: коды выхода у них разные.
+        assert not isinstance(excinfo.value, ServiceNotFound)
+
+        stored = await service._storage.get_outbox(item.id)
+        assert stored is not None
+        assert stored.state is OutboxState.QUEUED
+        assert stored.discard_reason is None
+    finally:
+        await service.stop()
+
+
+async def test_discard_of_missing_item_is_not_found(service: UserbotService) -> None:
+    """Отказ от несуществующей записи — «не найдено», а не конфликт."""
+    with pytest.raises(ServiceNotFound):
+        await service.discard_message(424242, "нечего отменять")
+
+
+async def test_discarded_item_cannot_be_retried(service: UserbotService) -> None:
+    """Решение окончательно: повторить запись после отказа нельзя."""
+    item_id = await _refused_without_trace(service, "chat-final", "решено не слать")
+    await service.discard_message(item_id, "дублирует сообщение из другого канала")
+
+    with pytest.raises(ServiceError) as excinfo:
+        await service.retry_message(item_id)
+    assert not isinstance(excinfo.value, ServiceNotFound)
+
+
+async def test_discarded_state_is_counted_in_status(service: UserbotService) -> None:
+    """Новое состояние обязано быть видно в статусе, а не молча выпасть."""
+    before = (await service.status())["outbox"]
+    assert isinstance(before, dict)
+    # Состояние показывается нулём ещё до первого отказа: иначе по статусу
+    # нельзя отличить «таких записей нет» от «их не считают».
+    assert before[OutboxState.DISCARDED.value] == 0
+
+    item_id = await _refused_without_trace(service, "chat-stats", "в статистику")
+    await service.discard_message(item_id, "неактуально")
+
+    after = (await service.status())["outbox"]
+    assert isinstance(after, dict)
+    assert after[OutboxState.DISCARDED.value] == 1
+    assert after[OutboxState.FAILED.value] == 0
+
+
+async def test_discard_without_reason_is_a_programming_error(service: UserbotService) -> None:
+    """Правило «причина обязательна» принадлежит ядру, а не схеме запроса.
+
+    Проверка на границе HTTP отсекает пустую строку раньше, но плагин ходит в
+    сервис напрямую — и записать окончательное решение без объяснения не должен
+    и он.
+    """
+    item_id = await _refused_without_trace(service, "chat-noreason", "без объяснения")
+
+    for empty in ("", "   "):
+        with pytest.raises(ValueError):
+            await service.discard_message(item_id, empty)
+
+    stored = await service._storage.get_outbox(item_id)
+    assert stored is not None
+    assert stored.state is OutboxState.FAILED
+
+
+async def test_known_discard_event_is_not_shown_twice(service: UserbotService) -> None:
+    """Отказ, который журнал уже видел, подписчику второй раз не показывают.
+
+    Случай возможен только при вмешательстве в базу мимо демона, но именно
+    тогда и важно, чтобы поток событий не разошёлся с журналом.
+    """
+    item_id = await _refused_without_trace(service, "chat-twice", "повторное событие")
+    stored = await service._storage.get_outbox(item_id)
+    assert stored is not None
+    await service._storage.record_event(discarded_event(stored, "занятый ключ"))
+
+    queue = service.subscribe()
+    try:
+        result = await service.discard_message(item_id, "решение принято")
+    finally:
+        service.unsubscribe(queue)
+
+    assert result["state"] == OutboxState.DISCARDED.value
+    assert queue.empty()
+    events = await service.recent_events(limit=50, after_id=0)
+    assert len([e for e in events if e["kind"] == "message.discarded"]) == 1
+
+
+async def test_discard_is_recorded_in_events(service: UserbotService) -> None:
+    """Подписчик узнаёт и такой исход: иначе отправка для него не завершится."""
+    item_id = await _refused_without_trace(service, "chat-event", "в журнал")
+    await service.discard_message(item_id, "адресат уже ответил")
+
+    events = await service.recent_events(limit=50, after_id=0)
+    discarded = [e for e in events if e["kind"] == "message.discarded"]
+    assert len(discarded) == 1
+    payload = discarded[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["outbox_id"] == item_id
+    assert payload["reason"] == "адресат уже ответил"
 
 
 async def test_retry_is_scheduled_not_immediate(service: UserbotService) -> None:

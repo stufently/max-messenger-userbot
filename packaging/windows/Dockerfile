@@ -16,10 +16,10 @@
 # остаётся верным на любой архитектуре. Тег рядом — чтобы было видно, что
 # закреплено.
 #
-# Чего digest НЕ закрепляет: `apt-get install` ниже ходит в изменяемые
-# репозитории Debian, и версии Wine в них со временем меняются. Полная фиксация
-# потребовала бы snapshot.debian.org; пока это осознанно оставлено плавающим —
-# закреплён базовый слой и всё, что относится к Python.
+# Чего digest сам по себе не закрепляет: `apt-get install` ниже ходит в
+# репозиторий Debian, а тот изменяемый — по тем же именам пакетов через полгода
+# встал бы другой Wine, то есть exe собрался бы в другой среде. Поэтому
+# источники apt ниже переключаются на снимок репозитория (snapshot.debian.org).
 FROM debian@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 # debian:trixie-slim
 
@@ -30,6 +30,16 @@ FROM debian@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a
 ARG PYTHON_VERSION=3.13.14
 ARG PYTHON_SHA256=c54d9b9bbb8a36e6489363ddd01139707fd781d72f1f9e90c7ec65d0061368e0
 ARG PYTHON_DIR="C:\\Python313"
+
+# Дата снимка репозитория Debian. Взята не на глаз: официальный образ Debian сам
+# записывает в /etc/apt/sources.list.d/debian.sources комментарий с тем снимком,
+# из которого собран, и у образа под digest выше это ровно 20260713T000000Z.
+# Совпадение с digest обязательно в одну сторону: снимок РАНЬШЕ базового слоя
+# означал бы, что apt видит версии ниже уже установленных в образе, и
+# зависимости перестают разрешаться на ровном месте. При смене digest дату надо
+# перечитать из самого образа, а не подставить сегодняшнюю:
+#   docker run --rm debian@<digest> cat /etc/apt/sources.list.d/debian.sources
+ARG DEBIAN_SNAPSHOT=20260713T000000Z
 
 # UID/GID того, кто собирает. Wine отказывается работать с префиксом, который
 # ему не принадлежит («'/opt/wine' is not owned by you»), — прав на запись мало,
@@ -46,10 +56,61 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/opt/wine-home \
     WINEPYTHON="C:\\Python313\\python.exe"
 
+# Снимок вместо живого зеркала. Выбран он, а не закрепление номеров версий
+# (`apt-get install wine=10.0~repack-6`): номер уезжает из репозитория при первом
+# же обновлении, и такая «фиксация» не воспроизводит сборку, а ломает её. Снимок
+# же отдаёт тот же индекс пакетов сколько угодно лет спустя, и списку пакетов
+# ниже не нужно знать ни одной версии — их выбирает apt, но из застывшего
+# состояния репозитория.
+#
+# Check-Valid-Until: no — Release в снимке подписан датой снимка, а apt считает
+# индексы протухшими примерно через неделю. Подпись при этом проверяется как и
+# раньше (Signed-By на штатный keyring), отключена только проверка свежести —
+# ровно та, которая по смыслу снимка всегда будет провалена.
+#
+# Чем платим: snapshot.debian.org — один сервис без зеркал, он заметно медленнее
+# deb.debian.org и периодически отдаёт 5xx под нагрузкой. Отсюда Acquire::Retries.
+#
+# Сверка снимка с базовым образом делается здесь, а не «глазами при правке»:
+# свой снимок официальный образ записывает комментарием в тот самый файл,
+# который мы сейчас перезапишем, — после перезаписи проверять будет нечего.
+# Так замена digest без замены даты падает сразу и с объяснением, а не всплывает
+# через полгода конфликтом зависимостей.
+RUN set -eux; \
+    sources=/etc/apt/sources.list.d/debian.sources; \
+    for archive in debian debian-security; do \
+        grep -q "archive/${archive}/${DEBIAN_SNAPSHOT}" "$sources" || { \
+            echo "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT} расходится с базовым образом;" >&2; \
+            echo "в образе записано:" >&2; \
+            grep -F snapshot.debian.org "$sources" >&2; \
+            exit 1; \
+        }; \
+    done; \
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
+        'Suites: trixie trixie-updates' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+        'Check-Valid-Until: no' \
+        '' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
+        'Suites: trixie-security' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+        'Check-Valid-Until: no' \
+        > "$sources"; \
+    printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-snapshot-retries
+
 # wine32:i386 нужен не ради 32-битных программ, а потому что установщик Python
 # с python.org — 32-битный загрузчик даже в amd64-варианте: без него он
 # завершается с ошибкой загрузки модуля.
 # xvfb+xauth: установщик и PyInstaller создают окна, а контейнер без дисплея.
+#
+# Версий в списке нет намеренно: их закрепляет снимок выше. Дублировать номера
+# здесь значило бы завести второй источник правды, который разъедется с датой
+# снимка при первой же правке.
 RUN dpkg --add-architecture i386 \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -61,6 +122,22 @@ RUN dpkg --add-architecture i386 \
         xauth \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+# Проверка не косметическая. В Wine 8 нет KERNEL32.CopyFile2, которой пользуется
+# Python 3.13, и `ensurepip` падает; сама ошибка при этом всплывает минут через
+# двадцать, уже на установке Python. Если дату снимка когда-нибудь передвинут на
+# репозиторий, где Wine ниже 10, сборка должна остановиться здесь и назвать
+# причину, а не заставлять разбираться в чужом стектрейсе pip.
+#
+# Сравнение отдано `dpkg --compare-versions`, а не шаблону по строке: версии
+# Debian не сравниваются лексикографически. `10.0~repack-6` меньше `10.0`, а
+# epoch (`1:10.0`) сдвигает всю строку — самодельная проверка на таких формах
+# либо промахивается, либо запрещает валидную версию.
+RUN set -eux; \
+    wine_version="$(dpkg-query -W -f='${Version}' wine)"; \
+    echo "wine ${wine_version}"; \
+    dpkg --compare-versions "$wine_version" ge 10 \
+        || { echo "нужен Wine >= 10, из снимка встал ${wine_version}" >&2; exit 1; }
 
 # Пользователь сборки. `|| true` — на случай, если такой UID/GID в образе уже
 # занят системным пользователем: тогда достаточно того, что он существует.

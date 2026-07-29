@@ -43,6 +43,9 @@ class ConnectionManager:
         self._emit = emit
         self._backfill = Backfiller(repo, emit)
         self._transports: dict[int, Transport] = {}
+        # Последняя известная сессия аккаунта. Держится отдельно от той, что
+        # запомнил надзор: сервер может выдать новую при любом подключении.
+        self._sessions: dict[int, Session] = {}
         self._supervisors = SupervisorRegistry()
 
     # --- доступ -------------------------------------------------------------
@@ -64,8 +67,12 @@ class ConnectionManager:
 
     # --- подключение --------------------------------------------------------
 
-    async def connect(self, account_id: int, session: Session) -> None:
+    async def connect(self, account_id: int, session: Session) -> Session:
         """Подключает аккаунт, доводит до готовности и оставляет под надзором.
+
+        Возвращает сессию, с которой аккаунт действительно работает: сервер мог
+        выдать новую прямо на этом подключении. Вызывающему она нужна, чтобы
+        сохранить именно её — записав ту, что передал, он затёр бы обновлённую.
 
         Ошибку наверх пробрасывает намеренно: вызывающий решает, что делать с
         неудачей. Надзор при этом не заводится — для этого есть
@@ -77,7 +84,7 @@ class ConnectionManager:
         transport = self.ensure(account_id)
         await self._repo.set_account_state(account_id, AccountState.CONNECTING)
         try:
-            await transport.connect(session)
+            session = await self._remember(account_id, session, await transport.connect(session))
         except TransportAuthError as exc:
             await self._repo.set_account_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
             raise
@@ -94,6 +101,7 @@ class ConnectionManager:
             await self._repo.set_account_state(account_id, AccountState.BACKOFF, str(exc))
             raise
         self._start_supervisor(account_id, session, pump)
+        return session
 
     def supervise(self, account_id: int, session: Session) -> None:
         """Заводит надзор над аккаунтом, который подключить не удалось.
@@ -157,13 +165,33 @@ class ConnectionManager:
         await self._close_transport(account_id)
         transport = self._factory()
         self._transports[account_id] = transport
+        # Надзор держит ту сессию, с которой аккаунт подняли изначально, а
+        # сервер мог выдать новую по дороге. Берём последнюю известную, иначе
+        # переподключение раз за разом ходило бы с протухшим токеном.
+        session = self._sessions.get(account_id, session)
         try:
             await self._repo.set_account_state(account_id, AccountState.CONNECTING)
-            await transport.connect(session)
+            await self._remember(account_id, session, await transport.connect(session))
             return await self._open_stream(account_id, transport)
         except BaseException:
             await self._close_transport(account_id)
             raise
+
+    async def _remember(
+        self, account_id: int, current: Session, refreshed: Session | None
+    ) -> Session:
+        """Запоминает сессию аккаунта, сохраняя обновлённую сервером.
+
+        Транспорт возвращает новую сессию только тогда, когда сервер её выдал.
+        Записать её надо сразу: следующий запуск демона возьмёт сессию из базы,
+        и старый токен там означал бы просьбу войти заново — при том что вход
+        только что прошёл успешно.
+        """
+        session = refreshed if refreshed is not None else current
+        self._sessions[account_id] = session
+        if refreshed is not None:
+            await self._repo.save_session(account_id, session.model_dump(mode="json"))
+        return session
 
     # --- остановка ----------------------------------------------------------
 
@@ -176,6 +204,7 @@ class ConnectionManager:
     async def disconnect(self, account_id: int) -> None:
         await self._supervisors.stop(account_id)
         await self._close_transport(account_id)
+        self._sessions.pop(account_id, None)
 
     async def shutdown(self) -> None:
         for account_id in self._supervisors.accounts():

@@ -16,7 +16,7 @@ import logging
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
 from maxub.core.events import EventBus
-from maxub.core.manual_retry import ManualRetry, OutboxItemBusy, OutboxItemNotFound
+from maxub.core.manual_retry import ManualRetry
 from maxub.core.models import (
     Account,
     AccountState,
@@ -28,6 +28,7 @@ from maxub.core.models import (
 )
 from maxub.core.ports import TransportFactory
 from maxub.core.ratelimit import RateLimiter
+from maxub.core.review import OutboxItemBusy, OutboxItemNotFound
 from maxub.core.sender import SEND_ACTION, OutboxWorker
 from maxub.core.storage import DuplicateAccountError, Storage
 from maxub.core.sync import ConnectionManager
@@ -224,12 +225,16 @@ class UserbotService:
         результатом неудачного входа. Обратный порядок в худшем случае теряет
         новую сессию при падении процесса, и аккаунт просто попросит войти
         заново — это дешевле потери доступа.
+
+        Сохраняется именно та сессия, которую вернуло подключение: сервер мог
+        выдать новый токен прямо на первом входе, и запись исходной затёрла бы
+        его — в памяти остался бы новый, а в базе старый.
         """
         try:
-            await self._connections.connect(account_id, session)
+            active = await self._connections.connect(account_id, session)
         except TransportAuthError as exc:
             raise ServiceError(str(exc)) from exc
-        await self._storage.save_session(account_id, session.model_dump(mode="json"))
+        await self._storage.save_session(account_id, active.model_dump(mode="json"))
         return await self._require_account(account_id)
 
     # --- отправка -----------------------------------------------------------
@@ -276,6 +281,22 @@ class UserbotService:
         except OutboxItemBusy as exc:
             raise ServiceError(str(exc)) from exc
         return result.model_dump(mode="json")
+
+    async def discard_message(self, item_id: int, reason: str) -> dict[str, object]:
+        """Закрывает отказавшую запись без отправки по решению человека.
+
+        Второй исход ручного разбора рядом с повтором: часть застрявших
+        сообщений отправлять уже не нужно — устарели, ушли другим способом,
+        поставлены по ошибке. Без этого решения они оставались бы в списке
+        навсегда и прятали бы в нём те записи, которыми ещё стоит заняться.
+        """
+        try:
+            item = await self._manual_retry.discard(item_id, reason)
+        except OutboxItemNotFound as exc:
+            raise ServiceNotFound(str(exc)) from exc
+        except OutboxItemBusy as exc:
+            raise ServiceError(str(exc)) from exc
+        return item.model_dump(mode="json")
 
     async def fetch_history(
         self, account_id: int, chat_id: str, limit: int

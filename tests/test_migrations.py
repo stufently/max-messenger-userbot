@@ -17,6 +17,7 @@ from maxub.core.crypto import SecretBox, generate_key
 from maxub.core.storage import migrations as migrations_module
 from maxub.core.storage.base import Database
 from maxub.core.storage.migrations import (
+    MIGRATIONS,
     SCHEMA_VERSION,
     Migration,
     SchemaVersionError,
@@ -139,7 +140,7 @@ async def test_legacy_database_is_upgraded_without_data_loss(tmp_path: Path) -> 
     db = build_database(path)
     await db.open()
     try:
-        assert "next_attempt_at" in await columns(db, "outbox")
+        assert {"next_attempt_at", "discard_reason", "discarded_at"} <= await columns(db, "outbox")
         # Новый столбец у старых строк пуст — планировщик считает такие
         # сообщения готовыми к отправке, это и есть ожидаемое поведение.
         async with db.db.execute("SELECT * FROM outbox") as cursor:
@@ -157,6 +158,82 @@ async def test_legacy_database_is_upgraded_without_data_loss(tmp_path: Path) -> 
         await db.db.commit()
     finally:
         await db.close()
+    assert user_version(path) == SCHEMA_VERSION
+
+
+async def make_previous_version_db(path: Path) -> None:
+    """База версии, предшествующей текущей, с отказавшей записью внутри.
+
+    Собирается шагами самих миграций, а не отдельным DDL: смысл теста — путь
+    «предыдущий выпуск демона обновился до этого», и стартовая точка обязана
+    совпадать с тем, что тот выпуск действительно создавал.
+    """
+    raw = await aiosqlite.connect(path)
+    try:
+        for migration in MIGRATIONS[:-1]:
+            for statement in migration.statements:
+                await raw.execute(statement)
+        await raw.execute(f"PRAGMA user_version = {MIGRATIONS[-2].version:d}")
+        await raw.execute(
+            "INSERT INTO accounts (id, phone, state, created_at, updated_at)"
+            " VALUES (1, '+79990000009', 'ready', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        await raw.execute(
+            "INSERT INTO outbox (id, account_id, chat_id, text, idempotency_key, state,"
+            " attempts, error, created_at)"
+            " VALUES (7, 1, 'chat', 'до обновления', 'key-old', 'failed', 3, 'канал занят',"
+            " '2026-01-01T00:00:00')"
+        )
+        await raw.commit()
+    finally:
+        await raw.close()
+
+
+async def test_previous_version_learns_to_store_refusals(tmp_path: Path) -> None:
+    """База прошлого выпуска доводится до актуальной, и отказ в ней уже пишется.
+
+    Проверяется не только появление столбцов: важно, что старая отказавшая
+    запись пережила обновление вместе с ошибкой, ради которой её и оставили
+    человеку.
+    """
+    path = tmp_path / "previous.db"
+    await make_previous_version_db(path)
+    assert user_version(path) == SCHEMA_VERSION - 1
+
+    db = build_database(path)
+    await db.open()
+    try:
+        assert {"discard_reason", "discarded_at"} <= await columns(db, "outbox")
+        async with db.db.execute("SELECT * FROM outbox WHERE id = 7") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        # Данные на месте, новые столбцы пусты — записи, разобранные до
+        # обновления, не притворяются отказанными.
+        assert (row["text"], row["state"], row["attempts"]) == ("до обновления", "failed", 3)
+        assert (row["error"], row["discard_reason"], row["discarded_at"]) == (
+            "канал занят",
+            None,
+            None,
+        )
+        await db.db.execute(
+            "UPDATE outbox SET state = 'discarded', discard_reason = 'устарело',"
+            " discarded_at = '2026-02-01T00:00:00' WHERE id = 7"
+        )
+        await db.db.commit()
+    finally:
+        await db.close()
+    assert user_version(path) == SCHEMA_VERSION
+
+    # Повторное открытие ничего не переделывает: отказ остаётся отказом.
+    again = build_database(path)
+    await again.open()
+    try:
+        async with again.db.execute("SELECT * FROM outbox WHERE id = 7") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert (row["state"], row["discard_reason"]) == ("discarded", "устарело")
+    finally:
+        await again.close()
     assert user_version(path) == SCHEMA_VERSION
 
 

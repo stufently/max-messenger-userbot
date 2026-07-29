@@ -34,10 +34,12 @@ def outbox_row(row: aiosqlite.Row) -> OutboxItem:
         attempts=row["attempts"],
         remote_message_id=row["remote_message_id"],
         error=row["error"],
+        discard_reason=row["discard_reason"],
         created_at=parse_dt(row["created_at"]),
         claimed_at=parse_dt(row["claimed_at"]) if row["claimed_at"] else None,
         next_attempt_at=parse_dt(row["next_attempt_at"]) if row["next_attempt_at"] else None,
         sent_at=parse_dt(row["sent_at"]) if row["sent_at"] else None,
+        discarded_at=parse_dt(row["discarded_at"]) if row["discarded_at"] else None,
     )
 
 

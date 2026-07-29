@@ -38,20 +38,25 @@ def outbox(
     ctx: typer.Context,
     state: Annotated[
         str | None,
-        typer.Option(help="Только это состояние: failed или sending."),
+        typer.Option(help="Только это состояние: failed, sending или discarded."),
     ] = None,
     limit: Annotated[int, typer.Option(help="Сколько записей вернуть.")] = 50,
 ) -> None:
     """Показать записи очереди, которые ждут решения человека.
 
     Без `--state` это отказавшие и застрявшие «в полёте»: остальные движутся
-    сами. Идентификатор из первого столбца принимает команда `retry`.
+    сами. Идентификатор из первого столбца принимают команды `retry` и
+    `discard`. `--state discarded` показывает уже разобранное — то, что решили
+    не отправлять, вместе с причиной.
     """
     params: dict[str, object] = {"limit": limit}
     if state:
         params["state"] = state
     data = client_of(ctx).get("/outbox", params=params)
-    table = Table("id", "аккаунт", "чат", "состояние", "попыток", "создано", "ошибка")
+    # Ошибка и причина отказа стоят разными столбцами: первая объясняет, почему
+    # не получилось, вторая — почему решили не пробовать снова. Слитые в один
+    # столбец, они бы читались как одно и то же.
+    table = Table("id", "аккаунт", "чат", "состояние", "попыток", "создано", "ошибка", "отказ")
     for item in data:
         table.add_row(
             str(item["id"]),
@@ -61,6 +66,7 @@ def outbox(
             str(item["attempts"]),
             str(item["created_at"]),
             item.get("error") or "",
+            item.get("discard_reason") or "",
         )
     emit(ctx, data, table)
 
@@ -81,6 +87,25 @@ def retry(
     запись у демона забирать нельзя: такой вызов завершается кодом 5.
     """
     emit(ctx, client_of(ctx).post(f"/outbox/{item_id}/retry"))
+
+
+def discard(
+    ctx: typer.Context,
+    item_id: Annotated[int, typer.Option("--id", help="Идентификатор записи очереди.")],
+    reason: Annotated[str, typer.Option(help="Почему решили не отправлять.")],
+) -> None:
+    """Отказаться от записи: сообщение не будет отправлено.
+
+    Для того, что отправлять уже не нужно, — устарело, ушло другим способом,
+    поставлено по ошибке. Решение окончательное: вернуть запись в очередь после
+    отказа нельзя, передумавший отправляет новое сообщение.
+
+    Причина обязательна: она остаётся единственным объяснением того, почему
+    сообщение так и не ушло. Исходная ошибка отправки при этом сохраняется.
+    Отказаться можно только от записи в состоянии failed — живую запись демон не
+    отдаёт, такой вызов завершается кодом 5.
+    """
+    emit(ctx, client_of(ctx).post(f"/outbox/{item_id}/discard", json={"reason": reason}))
 
 
 def history(

@@ -38,6 +38,12 @@ class OutboxState(StrEnum):
     захваченная пачка выглядела бы неоднозначной, хотя дальше первой записи
     дело не дошло: остальные пришлось бы отдавать человеку вместо простого
     повтора.
+
+    DISCARDED отделён от FAILED по той же причине: FAILED — «отправить не
+    получилось, решение ещё не принято», DISCARDED — «человек разобрал запись и
+    решил не отправлять». Смешать их значило бы потерять единственный признак,
+    по которому видно, ждёт запись разбора или он уже закончен, — и в списке
+    застрявшего, и в статистике очереди.
     """
 
     QUEUED = "queued"
@@ -45,6 +51,7 @@ class OutboxState(StrEnum):
     SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
+    DISCARDED = "discarded"
 
 
 class Account(BaseModel):
@@ -67,10 +74,15 @@ class OutboxItem(BaseModel):
     attempts: int = 0
     remote_message_id: str | None = None
     error: str | None = None
+    # Причина отказа лежит отдельно от `error`: там записано, почему отправка не
+    # получилась, и при разборе спустя месяцы это нужно ровно так же, как и
+    # решение человека. Одно поле на двоих означало бы, что отказ стирает улику.
+    discard_reason: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     claimed_at: datetime | None = None
     next_attempt_at: datetime | None = None
     sent_at: datetime | None = None
+    discarded_at: datetime | None = None
 
 
 class Message(BaseModel):

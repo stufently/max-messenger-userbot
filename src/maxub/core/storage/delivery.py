@@ -148,19 +148,6 @@ class DeliveryMixin(EventsMixin):
         """
         return await self._close_as_sent(item_id, remote_message_id, event, OutboxState.SENDING)
 
-    async def mark_sent_after_review(
-        self, item_id: int, remote_message_id: str, event: Event
-    ) -> bool:
-        """Закрывает отказавшую запись, когда сверка нашла сообщение на сервере.
-
-        Отдельный метод, а не параметр соседнего: исходное состояние здесь
-        другое — запись уже отдана человеку, и «в полёте» её больше нет.
-        Условие по состоянию остаётся обязательным: между чтением записи и этим
-        вызовом стоит сетевая сверка, за время которой запись мог разобрать
-        второй оператор.
-        """
-        return await self._close_as_sent(item_id, remote_message_id, event, OutboxState.FAILED)
-
     async def _close_as_sent(
         self, item_id: int, remote_message_id: str, event: Event, from_state: OutboxState
     ) -> bool:
@@ -186,29 +173,3 @@ class DeliveryMixin(EventsMixin):
                 "UPDATE outbox SET state = ?, error = ? WHERE id = ?",
                 (OutboxState.FAILED.value, error, item_id),
             )
-
-    async def requeue(self, item_id: int) -> bool:
-        """Возвращает отказавшую запись в очередь по решению человека.
-
-        Разрешено только из ``failed``: остальные состояния принадлежат воркеру,
-        и отобрать у него запись посреди отправки — прямой путь к дублю у
-        получателя. Состояние проверяет сама СУБД: между чтением записи и этим
-        вызовом успевает пройти сетевая сверка, поэтому ``False`` означает
-        «состояние уже не то», и повторять после него вслепую нельзя.
-
-        Счётчик попыток обнуляется. Отказавшая запись обычно упёрлась в лимит, а
-        [claim_queued][maxub.core.storage.delivery.DeliveryMixin.claim_queued]
-        засчитывает попытку ещё до отправки — без сброса воркер закрыл бы запись
-        отказом, не дойдя до транспорта, и ручной повтор оказался бы фикцией.
-        Бесконечным цикл не станет: каждый повтор требует отдельного решения
-        человека. Следы прошлой попытки стираются вместе со счётчиком — они
-        описывают разбор, который уже закончился.
-        """
-        async with self.write() as db:
-            cursor = await db.execute(
-                "UPDATE outbox SET state = ?, attempts = 0, error = NULL,"
-                " next_attempt_at = NULL, claimed_at = NULL"
-                " WHERE id = ? AND state = ?",
-                (OutboxState.QUEUED.value, item_id, OutboxState.FAILED.value),
-            )
-        return cursor.rowcount == 1
