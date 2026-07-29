@@ -20,8 +20,8 @@ from starlette.websockets import WebSocketDisconnect
 
 from maxub.api.app import create_app
 from maxub.config import Settings
-from maxub.core.events import EventBus
-from maxub.core.models import Event
+from maxub.core.events import EventBus, account_state_event
+from maxub.core.models import AccountState, Event
 from maxub.transport.stub import STUB_CODE
 
 
@@ -153,3 +153,41 @@ def test_ws_delivers_events_as_they_happen(app_client: TestClient) -> None:
 
     assert payload["kind"] == "account.ready"
     assert payload["account_id"] == account_id
+
+
+def test_state_events_cover_what_needs_a_human() -> None:
+    """О потере авторизации, обрыве и выключении подписчик узнаёт из потока."""
+    for state in (AccountState.AUTH_REQUIRED, AccountState.BACKOFF, AccountState.DISABLED):
+        event = account_state_event(1, state, "причина")
+        assert event is not None
+        assert event.kind == f"account.{state.value}"
+        assert event.payload == {"state": state.value, "error": "причина"}
+
+
+def test_transient_states_are_not_announced() -> None:
+    """`connecting` и `syncing` сменяются парами при каждом переподключении.
+
+    В журнале они дали бы шум, за которым потерялось бы то, что действительно
+    требует внимания.
+    """
+    assert account_state_event(1, AccountState.CONNECTING, None) is None
+    assert account_state_event(1, AccountState.SYNCING, None) is None
+
+
+def test_repeated_transitions_are_not_deduplicated() -> None:
+    """Аккаунт может уходить в backoff много раз, и каждый раз это событие."""
+    first = account_state_event(1, AccountState.BACKOFF, "обрыв")
+    second = account_state_event(1, AccountState.BACKOFF, "обрыв")
+
+    assert first is not None and second is not None
+    assert first.dedup_key != second.dedup_key
+
+
+def test_auth_loss_reaches_the_journal(app_client: TestClient) -> None:
+    """Сквозная проверка: выключенный аккаунт оставляет след в журнале."""
+    account_id = app_client.post("/accounts", json={"phone": "+79990000103"}).json()["id"]
+
+    app_client.post(f"/accounts/{account_id}/disable", json={"reason": "проверка"})
+
+    kinds = [event["kind"] for event in app_client.get("/events").json()]
+    assert "account.disabled" in kinds

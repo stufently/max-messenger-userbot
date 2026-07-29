@@ -18,6 +18,7 @@ from functools import partial
 
 from maxub.config import Settings
 from maxub.core.backfill import Backfiller
+from maxub.core.events import account_state_event
 from maxub.core.models import AccountState, Event, Session
 from maxub.core.ports import AccountRepository, EventSink, TransportFactory
 from maxub.core.stream import open_stream
@@ -82,11 +83,11 @@ class ConnectionManager:
         # аккаунте недолго живут два живых потока, наперегонки пишущих курсор.
         await self._supervisors.stop(account_id)
         transport = self.ensure(account_id)
-        await self._repo.set_account_state(account_id, AccountState.CONNECTING)
+        await self._set_state(account_id, AccountState.CONNECTING)
         try:
             session = await self._remember(account_id, session, await transport.connect(session))
         except TransportAuthError as exc:
-            await self._repo.set_account_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
+            await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
             raise
         try:
             pump = await self._open_stream(account_id, transport)
@@ -94,11 +95,11 @@ class ConnectionManager:
             # Отказ может прийти и после `connect()` — например, подписка живого
             # потока упрётся в отозванную сессию. `BACKOFF` тут обещал бы, что
             # повтор поможет, а помогает только новый вход.
-            await self._repo.set_account_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
+            await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
             raise
         except Exception as exc:
             # Иначе аккаунт остался бы в syncing, хотя синхронизация встала.
-            await self._repo.set_account_state(account_id, AccountState.BACKOFF, str(exc))
+            await self._set_state(account_id, AccountState.BACKOFF, str(exc))
             raise
         self._start_supervisor(account_id, session, pump)
         return session
@@ -120,7 +121,7 @@ class ConnectionManager:
         того, как подписка подтверждена и пережила добор: `READY` при мёртвом
         потоке — это аккаунт, за которым никто не слушает сервер.
         """
-        await self._repo.set_account_state(account_id, AccountState.SYNCING)
+        await self._set_state(account_id, AccountState.SYNCING)
         pump = await open_stream(
             account_id,
             transport,
@@ -128,7 +129,7 @@ class ConnectionManager:
             self._emit,
             partial(self._backfill.run, account_id, transport),
         )
-        await self._repo.set_account_state(account_id, AccountState.READY)
+        await self._set_state(account_id, AccountState.READY)
         await self._emit(
             Event(
                 account_id=account_id,
@@ -170,12 +171,26 @@ class ConnectionManager:
         # переподключение раз за разом ходило бы с протухшим токеном.
         session = self._sessions.get(account_id, session)
         try:
-            await self._repo.set_account_state(account_id, AccountState.CONNECTING)
+            await self._set_state(account_id, AccountState.CONNECTING)
             await self._remember(account_id, session, await transport.connect(session))
             return await self._open_stream(account_id, transport)
         except BaseException:
             await self._close_transport(account_id)
             raise
+
+    async def _set_state(
+        self, account_id: int, state: AccountState, error: str | None = None
+    ) -> None:
+        """Меняет состояние аккаунта и сообщает об этом подписчикам.
+
+        Единая точка, а не пара вызовов на каждом переходе: половина переходов
+        осталась бы без события при первой же правке, и подписчик узнавал бы о
+        потере авторизации только опросом статуса.
+        """
+        await self._repo.set_account_state(account_id, state, error)
+        event = account_state_event(account_id, state, error)
+        if event is not None:
+            await self._emit(event)
 
     async def _remember(
         self, account_id: int, current: Session, refreshed: Session | None

@@ -8,13 +8,56 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 
-from maxub.core.models import Event
+from maxub.core.models import AccountState, Event, utcnow
 
 log = logging.getLogger(__name__)
 
 LISTENER_QUEUE_SIZE = 1000
+
+#: Состояния, о переходе в которые узнают подписчики. Промежуточных
+#: `connecting` и `syncing` здесь нет намеренно: при каждом переподключении они
+#: сменяются парами и в журнале дали бы шум, за которым потерялось бы главное.
+#: Готовность объявляет отдельное событие `account.ready` — у него своя защита
+#: от повторов, привязанная к соединению, а не ко времени.
+NOTIFIED_STATES = frozenset(
+    {AccountState.AUTH_REQUIRED, AccountState.BACKOFF, AccountState.DISABLED}
+)
+
+#: Счётчик переходов внутри запуска — часть ключа дедупликации, см. ниже.
+_STATE_SEQUENCE = itertools.count()
+
+
+def account_state_event(account_id: int, state: AccountState, error: str | None) -> Event | None:
+    """Событие о смене состояния аккаунта; ``None`` — сообщать не о чем.
+
+    Эти три состояния означают «дальше само не поедет»: нужен новый вход, идут
+    попытки переподключиться или аккаунт выключен человеком. Раньше о них можно
+    было узнать только опросом `/status` — то есть тот, кто подписался на живой
+    поток, пропускал именно то, ради чего подписывался.
+
+    Ключ дедупликации нарочно уникален: дедупликации здесь не место. Аккаунт
+    может уходить в `backoff` и возвращаться сколько угодно раз, и каждый такой
+    раз подписчику важен. Защита от повторов существует для событий, которые
+    сервер выдаёт заново после переподключения, — а это событие рождается у нас.
+
+    Одного времени для уникальности мало: разрешение системных часов в Windows
+    измеряется миллисекундами, и два перехода подряд получили бы одну отметку —
+    второй молча пропал бы на уникальном индексе журнала. Счётчик закрывает этот
+    случай внутри запуска, отметка времени — между запусками, когда счётчик
+    начинается заново.
+    """
+    if state not in NOTIFIED_STATES:
+        return None
+    mark = f"{utcnow().isoformat()}:{next(_STATE_SEQUENCE)}"
+    return Event(
+        account_id=account_id,
+        kind=f"account.{state.value}",
+        payload={"state": state.value, "error": error},
+        dedup_key=f"account-state:{account_id}:{state.value}:{mark}",
+    )
 
 
 class EventBus:

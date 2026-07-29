@@ -15,7 +15,7 @@ import logging
 
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
-from maxub.core.events import EventBus
+from maxub.core.events import EventBus, account_state_event
 from maxub.core.housekeeping import Housekeeper
 from maxub.core.manual_retry import ManualRetry
 from maxub.core.models import (
@@ -140,7 +140,7 @@ class UserbotService:
     async def _resume(self, account: Account) -> None:
         payload = await self._storage.load_session(account.id)
         if payload is None:
-            await self._storage.set_account_state(account.id, AccountState.AUTH_REQUIRED)
+            await self._set_state(account.id, AccountState.AUTH_REQUIRED)
             return
         session = Session.model_validate(payload)
         try:
@@ -154,7 +154,7 @@ class UserbotService:
             # перезапуска демона. Сеть при старте могла быть ещё не готова —
             # надзорный цикл продолжит попытки с растущей задержкой сам.
             log.warning("не удалось переподключить аккаунт %s: %s", account.id, exc)
-            await self._storage.set_account_state(account.id, AccountState.BACKOFF, str(exc))
+            await self._set_state(account.id, AccountState.BACKOFF, str(exc))
             self._connections.supervise(account.id, session)
 
     async def stop(self) -> None:
@@ -183,11 +183,11 @@ class UserbotService:
     async def disable_account(self, account_id: int, reason: str) -> Account:
         await self._require_account(account_id)
         await self._connections.disconnect(account_id)
-        await self._storage.set_account_state(account_id, AccountState.DISABLED, reason)
+        await self._set_state(account_id, AccountState.DISABLED, reason)
         return await self._require_account(account_id)
 
     async def _on_auth_lost(self, account_id: int, reason: str) -> None:
-        await self._storage.set_account_state(account_id, AccountState.AUTH_REQUIRED, reason)
+        await self._set_state(account_id, AccountState.AUTH_REQUIRED, reason)
 
     # --- авторизация --------------------------------------------------------
 
@@ -318,6 +318,20 @@ class UserbotService:
         transport = self._connections.ensure(account_id)
         messages = await transport.fetch_history(chat_id, limit)
         return [m.model_dump(mode="json") for m in messages]
+
+    async def _set_state(
+        self, account_id: int, state: AccountState, error: str | None = None
+    ) -> None:
+        """Меняет состояние аккаунта и сообщает об этом подписчикам.
+
+        Тот же приём, что и в [сопровождении соединений][maxub.core.sync]: пара
+        «записать и рассказать» держится в одном месте, иначе часть переходов
+        рано или поздно останется без события.
+        """
+        await self._storage.set_account_state(account_id, state, error)
+        event = account_state_event(account_id, state, error)
+        if event is not None:
+            await self._emit(event)
 
     # --- события ------------------------------------------------------------
 
