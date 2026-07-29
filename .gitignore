@@ -5,6 +5,12 @@
 sessions/
 secrets/
 
+# Каталог данных демона: токен API, БД с сессиями аккаунтов
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]

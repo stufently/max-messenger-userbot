@@ -1,0 +1,19 @@
+services:
+  userbot:
+    build: .
+    image: max-userbot:dev
+    container_name: max-userbot
+    # UID:GID пользователя deploy2 — иначе файлы в ./data создаются от root
+    # и пользователь теряет доступ к данным контейнера.
+    user: "1003:1003"
+    environment:
+      MAXUB_DATA_DIR: /data
+      # Только петля внутри контейнера: на 0.0.0.0 демон был бы доступен любому
+      # соседнему контейнеру в общей сети Docker, а не только `compose exec`.
+      MAXUB_HOST: 127.0.0.1
+      MAXUB_PORT: "8765"
+      MAXUB_TRANSPORT: stub
+      MAXUB_LOG_LEVEL: info
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
