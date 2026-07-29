@@ -12,6 +12,7 @@ Token bucket плюс случайный jitter. Ведро своё на каж
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -100,32 +101,33 @@ class RateLimiter:
         """Действующий штраф по ключу — ``None``, если его нет."""
         return self._penalty.get((account_id, action))
 
-    def wait_estimate(self, account_id: int, action: str) -> float:
-        """Сколько секунд заняло бы разрешение, если запросить его сейчас.
-
-        Ничего не расходует и никого не задерживает. Нужна вызывающему, чтобы
-        выбрать между «подождать здесь» и «вернуть работу в очередь и заняться
-        другим аккаунтом»: [acquire][maxub.core.ratelimit.RateLimiter.acquire]
-        такого выбора не оставляет — она просто спит.
-
-        Это оценка, а не обещание: пока вызывающий думает, штраф может
-        продлиться, а токен — уйти соседу.
-        """
-        key = (account_id, action)
-        wait = 0.0
-        penalty_until = self._penalty.get(key)
-        if penalty_until is not None:
-            wait = max(0.0, (penalty_until - utcnow()).total_seconds())
-        return wait + self._bucket(key).delay_for_next()
-
     def restore(self, account_id: int, action: str, until: datetime) -> None:
         """Возвращает штраф, сохранённый до перезапуска."""
         if until > utcnow():
             self._penalty[(account_id, action)] = until
 
     async def acquire(self, account_id: int, action: str) -> None:
+        """Берёт разрешение, сколько бы ни пришлось ждать."""
+        await self.try_acquire(account_id, action, max_wait=math.inf)
+
+    async def try_acquire(self, account_id: int, action: str, max_wait: float) -> datetime | None:
+        """Берёт разрешение, если ждать не дольше ``max_wait``.
+
+        Возвращает ``None``, когда разрешение взято, и момент, когда его можно
+        будет взять, когда ждать пришлось бы дольше дозволенного — тогда ничего
+        не расходуется и никто не задерживается.
+
+        Решение и его исполнение происходят под одним замком, и это главное
+        свойство метода. Раздельная пара «спросить оценку — потом взять»
+        оставляла бы окно, в которое штраф успевает продлиться: вызывающий
+        решает «подожду десять секунд», а ждёт час, и общий воркер стоит всё это
+        время. Такого окна здесь нет по построению.
+        """
         key = (account_id, action)
         async with self._lock(key):
+            wait = self._wait_estimate(key)
+            if wait > max_wait:
+                return utcnow() + timedelta(seconds=wait)
             await self._serve_penalty(key)
             bucket = self._bucket(key)
             # Ожидание в цикле, а не однократное: после сна ведро пересчитывается
@@ -143,6 +145,24 @@ class RateLimiter:
             if self._jitter > 0:
                 await asyncio.sleep(random.uniform(0, self._jitter))
             bucket.consume()
+            return None
+
+    def _wait_estimate(self, key: tuple[int, str]) -> float:
+        """Сколько секунд заняло бы разрешение, если брать его прямо сейчас.
+
+        Из двух ожиданий берётся большее, а не их сумма: они идут параллельно.
+        Ведро пополняется по часам и на время штрафа не замирает, поэтому к концу
+        штрафа токен уже накопился. Сумма завысила бы оценку и уводила бы в
+        отложенные записи те, которым хватило бы короткого ожидания на месте.
+
+        Джиттер в оценку не входит: он мал по сравнению с порогом и добавляется
+        уже после решения, а его учёт сделал бы оценку случайной величиной.
+        """
+        wait = 0.0
+        penalty_until = self._penalty.get(key)
+        if penalty_until is not None:
+            wait = max(0.0, (penalty_until - utcnow()).total_seconds())
+        return max(wait, self._bucket(key).delay_for_next())
 
     async def _serve_penalty(self, key: tuple[int, str]) -> None:
         """Досиживает штраф, назначенный сервером.

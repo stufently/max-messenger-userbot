@@ -119,9 +119,14 @@ class Settings(BaseSettings):
 
     # Лимиты. Значения консервативные, но это не «гарантированно безопасные»
     # пороги — таких для закрытого API не существует, см. docs/stack.md.
-    send_rate_per_minute: float = Field(default=12.0)
-    send_burst: int = Field(default=3)
-    send_jitter_seconds: float = Field(default=1.5)
+    #
+    # Границы заданы не для порядка. Нулевая частота — деление на ноль в расчёте
+    # задержки, отрицательная — молча выключенный лимит, то есть ровно та
+    # ситуация, от которой лимит и защищает. Ошибка в переменной окружения должна
+    # ронять запуск с внятным сообщением, а не превращать демон в безлимитный.
+    send_rate_per_minute: float = Field(default=12.0, gt=0)
+    send_burst: int = Field(default=3, ge=1)
+    send_jitter_seconds: float = Field(default=1.5, ge=0)
 
     # Сколько ждать разрешения прямо в цикле отправки, а не откладывать запись.
     # Порог существует потому, что воркер один на все аккаунты: длинный штраф по
@@ -131,10 +136,16 @@ class Settings(BaseSettings):
     # выше, поэтому порог ниже. Значение с запасом над обычным шагом ведра
     # (при 12 сообщениях в минуту это 5 секунд), чтобы штатный ритм отправки не
     # превращался в поток записей в базу.
-    limit_wait_threshold_seconds: float = Field(default=10.0)
+    limit_wait_threshold_seconds: float = Field(default=10.0, ge=0)
 
     # Запасной штраф, когда сервер отказал по лимиту, но не сказал, насколько.
-    rate_limit_fallback_seconds: float = Field(default=60.0)
+    rate_limit_fallback_seconds: float = Field(default=60.0, gt=0)
+
+    # Сколько дней хранить журнал событий; 0 — не подрезать вовсе. Очередь
+    # отправки не чистится ни при каком значении, объяснение — в
+    # `core/housekeeping.py`.
+    events_retention_days: int = Field(default=90, ge=0)
+    housekeeping_interval_seconds: float = Field(default=24 * 60 * 60, gt=0)
 
     @property
     def db_path(self) -> Path:

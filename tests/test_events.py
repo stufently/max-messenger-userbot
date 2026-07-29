@@ -143,6 +143,11 @@ def test_ws_delivers_events_as_they_happen(app_client: TestClient) -> None:
             "challenge_id"
         ]
         app_client.post("/login/complete", json={"challenge_id": challenge_id, "code": STUB_CODE})
+        # Событие сначала попадает в журнал и только потом раздаётся
+        # подписчикам, поэтому его наличие в журнале означает, что читать сокет
+        # уже есть что. Без этой проверки провал выглядел бы как зависший тест:
+        # у `receive_text` нет таймаута.
+        assert app_client.get("/events").json()
 
         payload = json.loads(socket.receive_text())
 

@@ -10,7 +10,7 @@ import pytest
 
 from maxub.config import Settings
 from maxub.core.crypto import SecretBox, SecretError
-from maxub.core.models import OutboxState, Session
+from maxub.core.models import OutboxState, Session, utcnow
 from maxub.core.review import discarded_event
 from maxub.core.service import ServiceError, ServiceNotFound, UserbotService
 from maxub.core.storage import Storage
@@ -781,3 +781,95 @@ async def test_wrong_key_cannot_read_sessions(settings: Settings) -> None:
             await foreign.load_session(account_id)
     finally:
         await foreign.close()
+
+
+async def test_long_penalty_does_not_stall_other_accounts(settings: Settings) -> None:
+    """Штраф по одному аккаунту не останавливает отправку у остальных.
+
+    Воркер очереди один на весь демон. Пока он высиживал штраф прямо в цикле,
+    получасовой отказ по одному аккаунту означал получасовой простой у всех —
+    ровно то, ради чего мультиаккаунт и заводился.
+    """
+    service = build_service(settings)
+    await service.start()
+    try:
+        slow = await login_by_phone(service, "+79990000201")
+        fast = await login_by_phone(service, "+79990000202")
+        transport = service._connections.get(slow)
+        assert isinstance(transport, StubTransport)
+        transport.fail_sends = 1
+        transport.fail_with = TransportRateLimited("слишком часто", retry_after=1800.0)
+
+        stuck, _ = await service.enqueue_message(slow, "chat-slow", "первое")
+        await wait_for(lambda: _state_is(service, stuck.id, OutboxState.QUEUED))
+        blocked, _ = await service.enqueue_message(slow, "chat-slow", "второе")
+        delivered, _ = await service.enqueue_message(fast, "chat-fast", "чужое")
+
+        await wait_for(lambda: _state_is(service, delivered.id, OutboxState.SENT))
+        assert await _state_is(service, blocked.id, OutboxState.QUEUED)
+    finally:
+        await service.stop()
+
+
+async def test_deferred_message_keeps_its_attempts(settings: Settings) -> None:
+    """Откладывание по лимиту не тратит попытки.
+
+    Попытку засчитывает захват записи, а в сеть отложенная запись не уходила.
+    Без отката счётчика сообщение под долгим штрафом исчерпало бы лимит попыток,
+    ни разу не побывав у сервера, и закрылось бы как отказавшее.
+    """
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service, "+79990000203")
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        transport.fail_sends = 1
+        transport.fail_with = TransportRateLimited("слишком часто", retry_after=1800.0)
+
+        first, _ = await service.enqueue_message(account_id, "chat-1", "первое")
+        await wait_for(lambda: _state_is(service, first.id, OutboxState.QUEUED))
+        item, _ = await service.enqueue_message(account_id, "chat-1", "второе")
+
+        # Дать воркеру несколько кругов: каждый круг — один захват записи.
+        await asyncio.sleep(2.0)
+        stored = await service._storage.get_outbox(item.id)
+        assert stored is not None
+        assert stored.state is OutboxState.QUEUED
+        assert stored.attempts == 0
+        assert stored.next_attempt_at is not None
+    finally:
+        await service.stop()
+
+
+async def test_rate_limit_without_retry_after_still_penalizes(settings: Settings) -> None:
+    """Отказ по лимиту без указания срока штрафуется запасным значением.
+
+    Иначе штрафа нет вовсе, остаётся общий backoff в несколько секунд — и демон
+    возвращается ровно туда, откуда его только что прогнали.
+    """
+    service = build_service(settings.model_copy(update={"rate_limit_fallback_seconds": 900.0}))
+    await service.start()
+    try:
+        account_id = await login_by_phone(service, "+79990000204")
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        transport.fail_sends = 1
+        transport.fail_with = TransportRateLimited("слишком часто", retry_after=None)
+
+        await service.enqueue_message(account_id, "chat-1", "без срока")
+
+        await wait_for(lambda: _has_penalty(service))
+        penalties = await service._storage.load_penalties()
+        assert (penalties[0][2] - utcnow()).total_seconds() > 600
+    finally:
+        await service.stop()
+
+
+async def _state_is(service: UserbotService, item_id: int, state: OutboxState) -> bool:
+    stored = await service._storage.get_outbox(item_id)
+    return stored is not None and stored.state is state
+
+
+async def _has_penalty(service: UserbotService) -> bool:
+    return bool(await service._storage.load_penalties())

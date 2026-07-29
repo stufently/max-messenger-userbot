@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import aiosqlite
 
@@ -58,6 +59,25 @@ class EventsMixin(Database):
         ) as cursor:
             rows = await cursor.fetchall()
         return [(row["id"], self._event(row)) for row in rows]
+
+    async def prune_events(self, older_than: datetime) -> int:
+        """Удаляет события старше указанного момента, возвращает их число.
+
+        Сравнение идёт по строке, а не по разобранной дате: `created_at` всегда
+        пишется как `utcnow().isoformat()`, то есть в UTC и с одинаковым видом
+        смещения, а такие строки сравниваются лексикографически в том же
+        порядке, что и сами моменты времени. Разбирать дату в SQL значило бы
+        отказаться от индексируемого сравнения ради того же результата.
+
+        Курсор `after_id` от подрезки не страдает: идентификаторы растут и не
+        переиспользуются, поэтому клиент, стоящий на старом `id`, просто
+        получит следующие сохранившиеся события, а не начнёт сначала.
+        """
+        async with self.write() as db:
+            cursor = await db.execute(
+                "DELETE FROM events WHERE created_at < ?", (older_than.isoformat(),)
+            )
+        return int(cursor.rowcount)
 
     @staticmethod
     def _event(row: aiosqlite.Row) -> Event:

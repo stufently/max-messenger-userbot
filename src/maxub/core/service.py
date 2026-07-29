@@ -16,6 +16,7 @@ import logging
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
 from maxub.core.events import EventBus
+from maxub.core.housekeeping import Housekeeper
 from maxub.core.manual_retry import ManualRetry
 from maxub.core.models import (
     Account,
@@ -113,7 +114,13 @@ class UserbotService:
         )
         self._manual_retry = ManualRetry(storage, self._connections.get, self._events.publish)
         self._login = LoginService(storage, self._connections)
+        self._housekeeper = Housekeeper(
+            storage,
+            retention_days=settings.events_retention_days,
+            interval_seconds=settings.housekeeping_interval_seconds,
+        )
         self._worker_task: asyncio.Task[None] | None = None
+        self._housekeeping_task: asyncio.Task[None] | None = None
 
     # --- жизненный цикл -----------------------------------------------------
 
@@ -128,6 +135,7 @@ class UserbotService:
         # спросить сервер об исходе отправки невозможно.
         await self._worker.reconcile_stale()
         self._worker_task = asyncio.create_task(self._worker.run())
+        self._housekeeping_task = asyncio.create_task(self._housekeeper.run())
 
     async def _resume(self, account: Account) -> None:
         payload = await self._storage.load_session(account.id)
@@ -151,10 +159,13 @@ class UserbotService:
 
     async def stop(self) -> None:
         self._worker.stop()
-        if self._worker_task is not None:
-            self._worker_task.cancel()
+        self._housekeeper.stop()
+        for task in (self._worker_task, self._housekeeping_task):
+            if task is None:
+                continue
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._worker_task
+                await task
         await self._connections.shutdown()
         await self._storage.close()
 

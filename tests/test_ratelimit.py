@@ -180,6 +180,67 @@ async def test_penalty_extended_while_waiting_is_served_to_the_end() -> None:
     assert watch.elapsed == pytest.approx(0.4, abs=TOLERANCE)
 
 
+async def test_try_acquire_takes_permission_when_the_wait_is_short() -> None:
+    """Уложились в дозволенное — разрешение выдано, ответ пустой."""
+    limiter = RateLimiter(rate_per_minute=FAST_RATE, burst=1, jitter_seconds=0.0)
+
+    assert await limiter.try_acquire(1, "send_text", max_wait=PERIOD) is None
+
+
+async def test_try_acquire_refuses_and_names_the_moment() -> None:
+    """Ждать дольше дозволенного — не ждать вовсе, а вернуть срок.
+
+    Именно это и позволяет воркеру не стоять на одном аккаунте: он получает
+    момент, на который можно отложить запись, и идёт к следующей.
+    """
+    limiter = RateLimiter(rate_per_minute=FAST_RATE, burst=1, jitter_seconds=0.0)
+    limiter.penalize(1, "send_text", retry_after=600.0)
+    watch = Stopwatch()
+
+    available_at = await limiter.try_acquire(1, "send_text", max_wait=1.0)
+
+    assert available_at is not None
+    assert (available_at - utcnow()).total_seconds() == pytest.approx(600.0, abs=2.0)
+    assert watch.elapsed == pytest.approx(0.0, abs=TOLERANCE)
+
+
+async def test_refused_try_acquire_consumes_nothing() -> None:
+    """Отказ не расходует токен — иначе спрашивать было бы себе дороже."""
+    limiter = RateLimiter(rate_per_minute=FAST_RATE, burst=1, jitter_seconds=0.0)
+    await limiter.acquire(1, "send_text")
+
+    for _ in range(5):
+        assert await limiter.try_acquire(1, "send_text", max_wait=0.0) is not None
+
+    watch = Stopwatch()
+    await limiter.acquire(1, "send_text")
+
+    # Пять списанных впустую токенов растянули бы это ожидание впятеро.
+    assert watch.elapsed == pytest.approx(PERIOD, abs=TOLERANCE)
+
+
+async def test_named_moment_is_not_the_sum_of_two_waits() -> None:
+    """Штраф и пополнение ведра идут параллельно, а не подряд.
+
+    Ведро пополняется по часам и на время штрафа не замирает, поэтому ждать
+    придётся столько, сколько длится большее из двух. Сумма завысила бы срок и
+    уводила бы в отложенные записи, которым хватило бы ожидания на месте.
+    """
+    limiter = RateLimiter(rate_per_minute=FAST_RATE, burst=1, jitter_seconds=0.0)
+    await limiter.acquire(1, "send_text")
+    limiter.penalize(1, "send_text", retry_after=4 * PERIOD)
+
+    available_at = await limiter.try_acquire(1, "send_text", max_wait=PERIOD)
+    assert available_at is not None
+    named_wait = (available_at - utcnow()).total_seconds()
+
+    watch = Stopwatch()
+    await limiter.acquire(1, "send_text")
+
+    assert named_wait == pytest.approx(4 * PERIOD, abs=TOLERANCE)
+    assert watch.elapsed == pytest.approx(4 * PERIOD, abs=TOLERANCE)
+
+
 async def test_jitter_stays_inside_its_bounds() -> None:
     """Джиттер добавляет не больше заявленного: это разброс, а не второй лимит."""
     limiter = RateLimiter(rate_per_minute=FAST_RATE * 10, burst=100, jitter_seconds=0.02)

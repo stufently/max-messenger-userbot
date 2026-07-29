@@ -12,7 +12,7 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from maxub.config import Settings
 from maxub.core.models import OutboxItem, utcnow
@@ -128,17 +128,17 @@ class OutboxWorker:
         if transport is None:
             await self._retry_or_fail(item, "нет активного соединения")
             return
-        wait = self._limiter.wait_estimate(item.account_id, SEND_ACTION)
-        if wait > self._settings.limit_wait_threshold_seconds:
-            # Долгое ожидание не высиживается на месте. Воркер один на все
-            # аккаунты, и штраф сервера по одному из них — хоть на час —
-            # остановил бы отправку у всех остальных, а захваченный остаток
-            # пачки провисел бы в claimed всё это время. Запись возвращается в
-            # очередь со сроком, воркер идёт дальше.
-            await self._repo.defer_claimed(item.id, utcnow() + timedelta(seconds=wait))
-            log.info("отправка %s отложена на %.0f с: действует лимит", item.id, wait)
+        # Долгое ожидание не высиживается на месте. Воркер один на все аккаунты,
+        # и штраф сервера по одному из них — хоть на час — остановил бы отправку
+        # у всех остальных, а захваченный остаток пачки провисел бы в claimed всё
+        # это время. Запись возвращается в очередь со сроком, воркер идёт дальше.
+        available_at = await self._limiter.try_acquire(
+            item.account_id, SEND_ACTION, max_wait=self._settings.limit_wait_threshold_seconds
+        )
+        if available_at is not None:
+            await self._repo.defer_claimed(item.id, available_at)
+            log.info("отправка %s отложена до %s: действует лимит", item.id, available_at)
             return
-        await self._limiter.acquire(item.account_id, SEND_ACTION)
         # Отметка ставится вплотную к сетевому вызову: всё, что до неё, точно
         # не дошло до сервера и повторяется без сверки.
         if not await self._repo.mark_sending(item.id):
@@ -154,10 +154,14 @@ class OutboxWorker:
             # то есть демон возвращается ровно туда, откуда его только что
             # прогнали. Запасное значение консервативное — лучше подождать
             # лишнее, чем получить второй отказ подряд.
-            retry_after = exc.retry_after or self._settings.rate_limit_fallback_seconds
+            fallback = self._settings.rate_limit_fallback_seconds
+            retry_after = exc.retry_after if exc.retry_after is not None else fallback
             until = self._limiter.penalize(item.account_id, SEND_ACTION, retry_after)
             await self._repo.save_penalty(item.account_id, SEND_ACTION, until)
-            await self._retry_or_fail(item, str(exc))
+            # Повтор назначается не раньше конца штрафа: иначе запись вернулась
+            # бы в работу через несколько секунд общего backoff только затем,
+            # чтобы тут же уйти в отложенные — лишний круг через базу.
+            await self._retry_or_fail(item, str(exc), not_before=until)
             return
         except TransportNotApplied as exc:
             await self._retry_or_fail(item, str(exc))
@@ -197,11 +201,21 @@ class OutboxWorker:
             # с задержкой и с оглядкой на лимит попыток.
             await self._retry_or_fail(item, str(exc))
 
-    async def _retry_or_fail(self, item: OutboxItem, error: str, *, now: bool = False) -> None:
+    async def _retry_or_fail(
+        self,
+        item: OutboxItem,
+        error: str,
+        *,
+        now: bool = False,
+        not_before: datetime | None = None,
+    ) -> None:
         """Назначает повтор или закрывает запись, если попытки исчерпаны.
 
         ``now`` снимает задержку — она нужна против частых обращений к серверу,
         а сообщение, пролежавшее до перезапуска, и так уже подождало.
+
+        ``not_before`` поднимает срок до известного заранее момента: смысла
+        будить запись раньше, чем истечёт штраф сервера, нет.
         """
         if item.attempts >= self._settings.max_send_attempts:
             await self._repo.mark_failed(
@@ -217,7 +231,10 @@ class OutboxWorker:
                 maximum=self._settings.retry_max_seconds,
             )
         )
-        await self._repo.schedule_retry(item.id, utcnow() + delay)
+        next_attempt_at = utcnow() + delay
+        if not_before is not None:
+            next_attempt_at = max(next_attempt_at, not_before)
+        await self._repo.schedule_retry(item.id, next_attempt_at)
 
 
 def backoff_delay(attempt: int, base: float, maximum: float) -> timedelta:

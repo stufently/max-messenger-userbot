@@ -23,6 +23,13 @@ EventSink = Callable[[Event], Awaitable[None]]
 EventPublisher = Callable[[Event], None]
 
 
+class EventJournal(Protocol):
+    """Обслуживание журнала событий. Отдельно от чтения и записи: уборке нужен
+    ровно один метод, и знать про остальное хранилище ей незачем."""
+
+    async def prune_events(self, older_than: datetime) -> int: ...
+
+
 class AccountRepository(Protocol):
     async def list_accounts(self) -> list[Account]: ...
 
