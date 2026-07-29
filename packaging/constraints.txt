@@ -44,7 +44,7 @@
 # --- прямые зависимости (объявлены в pyproject) ------------------------------
 aiosqlite==0.22.1
 cryptography==49.0.0
-fastapi==0.140.13
+fastapi==0.141.0
 httpx==0.28.1
 pydantic==2.13.4
 pydantic-settings==2.14.2
