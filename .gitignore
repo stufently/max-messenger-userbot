@@ -1,0 +1,23 @@
+# Секреты и сессии — никогда в git
+.env
+*.session
+*.session-journal
+sessions/
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Окружение
+.idea/
+.vscode/
+*.log
