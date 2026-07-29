@@ -73,6 +73,42 @@ def test_bad_token_exits_auth(api: TestClient) -> None:
     assert _run_cli(["--token", "wrong", "status"]) == client_module.EXIT_AUTH
 
 
+def test_tokens_lifecycle_from_cli(api: TestClient, capsys: pytest.CaptureFixture[str]) -> None:
+    """Выпуск, список и отзов — тем же клиентом, что и всё остальное."""
+    assert (
+        _run_cli(["--json", "tokens", "add", "--label", "монитор", "--scope", "accounts:read"])
+        == client_module.EXIT_OK
+    )
+    issued = json.loads(capsys.readouterr().out)
+    assert issued["token"]
+    assert issued["item"]["label"] == "монитор"
+
+    assert _run_cli(["--json", "tokens", "list"]) == client_module.EXIT_OK
+    listed = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in listed] == [issued["item"]["id"]]
+
+    assert (
+        _run_cli(["--json", "tokens", "revoke", "--id", str(issued["item"]["id"])])
+        == client_module.EXIT_OK
+    )
+    capsys.readouterr()
+    assert (
+        _run_cli(["--json", "tokens", "revoke", "--id", str(issued["item"]["id"])])
+        == client_module.EXIT_NOT_FOUND
+    )
+
+
+def test_missing_scope_exits_forbidden(api: TestClient, capsys: pytest.CaptureFixture[str]) -> None:
+    """403 отличается от 401 и кодом выхода: чинить их нужно по-разному."""
+    _run_cli(["--json", "tokens", "add", "--label", "читатель", "--scope", "accounts:read"])
+    token = json.loads(capsys.readouterr().out)["token"]
+
+    assert (
+        _run_cli(["--token", token, "--json", "accounts", "add", "--phone", "+79990000123"])
+        == client_module.EXIT_FORBIDDEN
+    )
+
+
 def test_send_to_unauthorized_account_exits_conflict(api: TestClient) -> None:
     _run_cli(["--json", "accounts", "add", "--phone", "+79990000001"])
     code = _run_cli(

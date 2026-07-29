@@ -13,19 +13,26 @@ from maxub.api.routes.common import (
     get_service,
     http_error,
 )
-from maxub.api.security import require_token
+from maxub.api.security import require
+from maxub.core.permissions import Scope
 from maxub.core.service import ServiceError, ServiceOverloaded, UserbotService
 from maxub.transport.base import TransportUnsupported
 
-router = APIRouter(dependencies=[Depends(require_token)])
+# Права проставлены на каждом маршруте отдельно: список аккаунтов и вход в
+# аккаунт — разные по последствиям действия, и общая зависимость на роутере
+# выдала бы читателю право входить.
+router = APIRouter()
+
+READ = Depends(require(Scope.ACCOUNTS_READ))
+WRITE = Depends(require(Scope.ACCOUNTS_WRITE))
 
 
-@router.get("/accounts")
+@router.get("/accounts", dependencies=[READ])
 async def list_accounts(service: UserbotService = Depends(get_service)) -> list[dict[str, object]]:
     return [a.model_dump(mode="json") for a in await service.list_accounts()]
 
 
-@router.post("/accounts", status_code=201)
+@router.post("/accounts", status_code=201, dependencies=[WRITE])
 async def add_account(
     payload: AddAccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -36,7 +43,7 @@ async def add_account(
     return account.model_dump(mode="json")
 
 
-@router.post("/accounts/{account_id}/disable")
+@router.post("/accounts/{account_id}/disable", dependencies=[WRITE])
 async def disable_account(
     account_id: int, payload: DisableRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -47,7 +54,7 @@ async def disable_account(
     return account.model_dump(mode="json")
 
 
-@router.get("/accounts/{account_id}/capabilities")
+@router.get("/accounts/{account_id}/capabilities", dependencies=[READ])
 async def account_capabilities(
     account_id: int, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -61,7 +68,7 @@ async def account_capabilities(
 # --- вход по телефону --------------------------------------------------------
 
 
-@router.post("/login/start")
+@router.post("/login/start", dependencies=[WRITE])
 async def login_start(
     payload: AccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, str]:
@@ -74,7 +81,7 @@ async def login_start(
     return {"challenge_id": challenge_id}
 
 
-@router.post("/login/complete")
+@router.post("/login/complete", dependencies=[WRITE])
 async def login_complete(
     payload: LoginCompleteRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -88,7 +95,7 @@ async def login_complete(
 # --- вход по QR-коду ---------------------------------------------------------
 
 
-@router.post("/login/qr/start")
+@router.post("/login/qr/start", dependencies=[WRITE])
 async def login_qr_start(
     payload: AccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -103,7 +110,7 @@ async def login_qr_start(
         raise http_error(404, exc) from exc
 
 
-@router.post("/login/qr/poll")
+@router.post("/login/qr/poll", dependencies=[WRITE])
 async def login_qr_poll(
     payload: ChallengeRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:

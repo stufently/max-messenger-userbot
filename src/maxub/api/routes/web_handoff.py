@@ -41,7 +41,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import RedirectResponse
 
 from maxub.api.routes.web_session import SECURITY_HEADERS, issue_session
-from maxub.api.security import require_token
+from maxub.api.security import authenticate
+from maxub.core.access import Principal
 from maxub.core.models import utcnow
 
 #: Куда ведёт обмен и откуда он начинается. Пути знает лаунчер
@@ -60,7 +61,11 @@ MAX_HANDOFF_CODES = 8
 
 
 class HandoffCodes:
-    """Реестр выданных кодов входа.
+    """Реестр выданных кодов входа вместе с их предъявителями.
+
+    Код несёт того, кто его заказал: сессия, полученная в обмен, получает ровно
+    его права. Иначе обмен был бы способом повысить права — ограниченный токен
+    просил бы код и получал бы полноправную панель.
 
     Просроченное выбрасывается при обращении, а не фоновой задачей — тот же
     подход, что у реестра запросов входа в `core/challenges.py`: записей
@@ -69,32 +74,35 @@ class HandoffCodes:
     """
 
     def __init__(self) -> None:
-        self._items: OrderedDict[str, datetime] = OrderedDict()
+        self._items: OrderedDict[str, tuple[datetime, Principal]] = OrderedDict()
 
-    def issue(self) -> str:
+    def issue(self, principal: Principal) -> str:
         self._sweep()
         # Вытесняется самый старый: свежий код нужнее, чем выданный и так и не
         # использованный полминуты назад.
         while len(self._items) >= MAX_HANDOFF_CODES:
             self._items.popitem(last=False)
         code = secrets.token_urlsafe(32)
-        self._items[code] = utcnow() + HANDOFF_TTL
+        self._items[code] = (utcnow() + HANDOFF_TTL, principal)
         return code
 
-    def consume(self, code: str) -> bool:
-        """Гасит код и говорит, годился ли он.
+    def consume(self, code: str) -> Principal | None:
+        """Гасит код и отдаёт предъявителя, если код годился.
 
         Изъятие идёт до проверки срока: код должен пропасть из реестра при любом
         обращении к нему, иначе «просроченный» и «уже использованный» стали бы
         разными состояниями с разной длиной жизни.
         """
         self._sweep()
-        expires_at = self._items.pop(code, None)
-        return expires_at is not None and expires_at > utcnow()
+        item = self._items.pop(code, None)
+        if item is None:
+            return None
+        expires_at, principal = item
+        return principal if expires_at > utcnow() else None
 
     def _sweep(self) -> None:
         now = utcnow()
-        for code, expires_at in list(self._items.items()):
+        for code, (expires_at, _) in list(self._items.items()):
             if expires_at <= now:
                 del self._items[code]
 
@@ -117,11 +125,18 @@ def _codes(request: Request) -> HandoffCodes:
     return codes
 
 
-@router.post("/handoff", dependencies=[Depends(require_token)])
-async def issue_handoff(request: Request) -> dict[str, object]:
-    """Выдаёт одноразовый код входа обладателю токена демона."""
+@router.post("/handoff")
+async def issue_handoff(
+    request: Request, principal: Principal = Depends(authenticate)
+) -> dict[str, object]:
+    """Выдаёт одноразовый код входа обладателю токена демона.
+
+    Отдельных прав не требует: код открывает панель ровно с теми правами, что
+    уже есть у токена, и требовать сверх этого значило бы запретить владельцу
+    ограниченного токена открыть свою же панель.
+    """
     return {
-        "code": _codes(request).issue(),
+        "code": _codes(request).issue(principal),
         "enter_path": ENTER_PATH,
         "expires_in": int(HANDOFF_TTL.total_seconds()),
     }
@@ -142,6 +157,7 @@ async def enter(
     response = RedirectResponse(
         url=PAGE_PATH, status_code=status.HTTP_303_SEE_OTHER, headers=dict(SECURITY_HEADERS)
     )
-    if code and _codes(request).consume(code):
-        issue_session(request, response)
+    principal = _codes(request).consume(code) if code else None
+    if principal is not None:
+        issue_session(request, response, principal)
     return response

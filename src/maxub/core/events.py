@@ -64,6 +64,7 @@ class EventBus:
     def __init__(self, queue_size: int = LISTENER_QUEUE_SIZE) -> None:
         self._queue_size = queue_size
         self._listeners: list[asyncio.Queue[Event]] = []
+        self._signals: list[asyncio.Event] = []
 
     def publish(self, event: Event) -> None:
         for queue in list(self._listeners):
@@ -73,6 +74,8 @@ class EventBus:
                 # Медленный подписчик не должен раздувать память демона:
                 # пропущенное он дочитает из журнала по курсору.
                 log.warning("подписчик не успевает читать события, событие отброшено")
+        for signal in list(self._signals):
+            signal.set()
 
     def subscribe(self) -> asyncio.Queue[Event]:
         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=self._queue_size)
@@ -82,3 +85,20 @@ class EventBus:
     def unsubscribe(self, queue: asyncio.Queue[Event]) -> None:
         with contextlib.suppress(ValueError):
             self._listeners.remove(queue)
+
+    def signal(self) -> asyncio.Event:
+        """Будильник вместо очереди: «что-то появилось», без самих событий.
+
+        Нужен тому, кто читает журнал сам и от шины хочет только одного — не
+        спать лишнюю секунду до следующего опроса. Очередь ему не подходит:
+        она переполняется на всплеске и роняет в лог предупреждение о медленном
+        подписчике, хотя терять здесь нечего — содержимое всё равно берётся из
+        базы.
+        """
+        signal = asyncio.Event()
+        self._signals.append(signal)
+        return signal
+
+    def drop_signal(self, signal: asyncio.Event) -> None:
+        with contextlib.suppress(ValueError):
+            self._signals.remove(signal)

@@ -22,9 +22,10 @@ async def _watch_shutdown(app_state: object, server: uvicorn.Server) -> None:
 
 async def serve(settings: Settings) -> None:
     settings.ensure_data_dir()
-    token = settings.resolve_token()
+    # Токен выдаёт сама сборка приложения: она же передаёт его проверке прав, и
+    # второй источник значения здесь означал бы, что демон верит одному токену,
+    # а показывает другой.
     app = create_app(settings)
-    app.state.api_token = token
 
     config = uvicorn.Config(
         app,

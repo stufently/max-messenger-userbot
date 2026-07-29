@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from maxub.core.permissions import Scope
+
 
 def utcnow() -> datetime:
     return datetime.now(tz=UTC)
@@ -130,6 +132,29 @@ class QrChallenge(BaseModel):
     challenge_id: str
     payload: str
     expires_at: datetime
+
+
+class ApiToken(BaseModel):
+    """Выпущенный токен API — всё, кроме самого секрета.
+
+    Секрета здесь нет и в базе его нет: хранится только отпечаток. Показать
+    токен второй раз демон не сможет даже по требованию владельца, и это
+    осознанно — украденная копия базы не даёт доступа к API.
+    """
+
+    id: int
+    label: str
+    scopes: frozenset[Scope]
+    created_at: datetime = Field(default_factory=utcnow)
+    expires_at: datetime | None = None
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+    def is_active(self, now: datetime | None = None) -> bool:
+        """Годен ли токен прямо сейчас: не отозван и не просрочен."""
+        if self.revoked_at is not None:
+            return False
+        return self.expires_at is None or self.expires_at > (now or utcnow())
 
 
 class Session(BaseModel):

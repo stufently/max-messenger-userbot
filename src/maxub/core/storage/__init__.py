@@ -11,9 +11,11 @@ from __future__ import annotations
 from maxub.core.storage.accounts import AccountsMixin
 from maxub.core.storage.base import Database, DuplicateAccountError
 from maxub.core.storage.events import EventsMixin
+from maxub.core.storage.handlers import HandlerCursorsMixin
 from maxub.core.storage.outbox import OutboxMixin
 from maxub.core.storage.penalties import PenaltiesMixin
 from maxub.core.storage.review import ReviewMixin
+from maxub.core.storage.tokens import TokensMixin
 
 
 class Storage(
@@ -23,6 +25,10 @@ class Storage(
     # `DeliveryMixin` приходит вместе с ними и отдельно не перечисляется.
     ReviewMixin,
     PenaltiesMixin,
+    TokensMixin,
+    # Курсоры обработчиков пишут события в общей транзакции, поэтому наследуют
+    # журнал напрямую — как аккаунты и доставка.
+    HandlerCursorsMixin,
     EventsMixin,
     Database,
 ):

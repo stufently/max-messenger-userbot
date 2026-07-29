@@ -11,7 +11,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
-from maxub.core.models import Account, AccountState, Event, OutboxItem, OutboxState
+from maxub.core.models import Account, AccountState, ApiToken, Event, OutboxItem, OutboxState
+from maxub.core.permissions import Scope
 from maxub.transport.base import Transport
 
 TransportFactory = Callable[[], Transport]
@@ -33,7 +34,53 @@ class EventJournal(Protocol):
     """Обслуживание журнала событий. Отдельно от чтения и записи: уборке нужен
     ровно один метод, и знать про остальное хранилище ей незачем."""
 
-    async def prune_events(self, older_than: datetime) -> int: ...
+    async def prune_events(self, older_than: datetime, keep_from_id: int | None = None) -> int: ...
+
+
+class TokenRepository(Protocol):
+    """Хранение выпущенных токенов API."""
+
+    async def create_token(
+        self,
+        label: str,
+        token_hash: str,
+        scopes: frozenset[Scope],
+        expires_at: datetime | None = None,
+    ) -> ApiToken: ...
+
+    async def find_token_by_hash(self, token_hash: str) -> ApiToken | None: ...
+
+    async def get_token(self, token_id: int) -> ApiToken | None: ...
+
+    async def list_tokens(self, include_revoked: bool = False) -> list[ApiToken]: ...
+
+    async def revoke_token(self, token_id: int) -> bool: ...
+
+    async def touch_token(self, token_id: int, now: datetime | None = None) -> None: ...
+
+
+class HandlerJournal(Protocol):
+    """Журнал глазами обработчиков: чтение по курсору и сам курсор."""
+
+    async def list_events(self, limit: int = 50, after_id: int = 0) -> list[tuple[int, Event]]: ...
+
+    async def record_event(self, event: Event) -> bool: ...
+
+    async def first_event_id(self) -> int | None: ...
+
+    async def last_event_id(self) -> int: ...
+
+    async def init_handler_cursor(self, name: str, start_after_id: int) -> int: ...
+
+    async def load_handler_cursor(self, name: str) -> int | None: ...
+
+    async def advance_handler_cursor(
+        self, name: str, after_id: int, event: Event | None = None
+    ) -> bool: ...
+
+    async def bump_handler_attempts(self, name: str, after_id: int) -> int: ...
+
+    async def handler_cursor_floor(self, names: Sequence[str]) -> int | None: ...
 
 
 class AccountRepository(Protocol):

@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import secrets
 
 from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
 
 from maxub.api.routes.common import MAX_PAGE_SIZE, get_service
-from maxub.api.security import require_token
+from maxub.api.security import authenticate_websocket, require
+from maxub.core.permissions import Scope
 from maxub.core.service import UserbotService
 
 router = APIRouter()
+
+# Журнал и живой поток отдают payload событий, а в нём лежат тексты входящих
+# сообщений. Поэтому мало права следить за состоянием: нужно и право читать
+# переписку, иначе `events:read` тихо оказался бы способом её прочитать в обход
+# `messages:read`.
+JOURNAL = (Scope.EVENTS_READ, Scope.MESSAGES_READ)
 
 
 @router.get("/health")
@@ -21,12 +27,12 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/status", dependencies=[Depends(require_token)])
+@router.get("/status", dependencies=[Depends(require(Scope.ACCOUNTS_READ))])
 async def status(service: UserbotService = Depends(get_service)) -> dict[str, object]:
     return await service.status()
 
 
-@router.get("/events", dependencies=[Depends(require_token)])
+@router.get("/events", dependencies=[Depends(require(*JOURNAL))])
 async def events(
     limit: int = Query(default=50, ge=1, le=MAX_PAGE_SIZE),
     after_id: int = Query(default=0, ge=0),
@@ -36,7 +42,7 @@ async def events(
     return await service.recent_events(limit=limit, after_id=after_id)
 
 
-@router.post("/shutdown", dependencies=[Depends(require_token)])
+@router.post("/shutdown", dependencies=[Depends(require(Scope.ADMIN))])
 async def shutdown(request: Request) -> dict[str, str]:
     request.app.state.shutdown_event.set()
     return {"status": "stopping"}
@@ -44,20 +50,8 @@ async def shutdown(request: Request) -> dict[str, str]:
 
 @router.websocket("/ws/events")
 async def ws_events(websocket: WebSocket) -> None:
-    """Поток событий. WebSocket используется только здесь и только для чтения.
-
-    Токен принимается заголовком, а не query-параметром: строка запроса
-    попадает в логи прокси и диагностику, заголовок — нет. Сравнение
-    постоянное по времени.
-    """
-    expected: str = websocket.app.state.api_token
-    header = websocket.headers.get("authorization") or ""
-    scheme, _, value = header.partition(" ")
-    provided = value if scheme.lower() == "bearer" else header
-    # Байты, а не строки: на не-ASCII символах сравнение строк бросает
-    # TypeError, и соединение падало бы с ошибкой вместо закрытия кодом 4401.
-    if not secrets.compare_digest(provided.strip().encode("utf-8"), expected.encode("utf-8")):
-        await websocket.close(code=4401)
+    """Поток событий. WebSocket используется только здесь и только для чтения."""
+    if await authenticate_websocket(websocket, *JOURNAL) is None:
         return
     await websocket.accept()
     service: UserbotService = websocket.app.state.service

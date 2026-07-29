@@ -18,10 +18,14 @@ EXIT_AUTH = 4
 EXIT_CONFLICT = 5
 EXIT_UNSUPPORTED = 6
 EXIT_NOT_FOUND = 7
+# Токен опознан, но прав не хватает. Отдельно от EXIT_AUTH: скрипту это разные
+# починки — сменить токен или попросить для него область доступа.
+EXIT_FORBIDDEN = 8
 
 _STATUS_TO_EXIT = {
     400: EXIT_ERROR,
     401: EXIT_AUTH,
+    403: EXIT_FORBIDDEN,
     404: EXIT_NOT_FOUND,
     409: EXIT_CONFLICT,
     422: EXIT_USAGE,

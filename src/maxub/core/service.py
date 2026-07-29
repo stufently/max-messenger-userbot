@@ -12,10 +12,12 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+from collections.abc import Sequence
 
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
 from maxub.core.events import EventBus, account_state_event
+from maxub.core.handlers import EventHandler, HandlerDispatcher, HandlerRegistry
 from maxub.core.housekeeping import Housekeeper
 from maxub.core.manual_retry import ManualRetry
 from maxub.core.models import (
@@ -94,6 +96,7 @@ class UserbotService:
         settings: Settings,
         storage: Storage,
         transport_factory: TransportFactory,
+        handlers: Sequence[EventHandler] = (),
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -116,13 +119,25 @@ class UserbotService:
         )
         self._manual_retry = ManualRetry(storage, self._connections.get, self._events.publish)
         self._login = LoginService(self._set_state, self._connections)
+        self._registry = HandlerRegistry(handlers)
+        self._dispatcher = HandlerDispatcher(
+            journal=storage,
+            registry=self._registry,
+            actions=self,
+            publish=self._events.publish,
+            wakeup=self._events.signal(),
+        )
         self._housekeeper = Housekeeper(
             storage,
             retention_days=settings.events_retention_days,
             interval_seconds=settings.housekeeping_interval_seconds,
+            # Уборка не заходит за самый отстающий курсор обработчика: журнал
+            # для них не «последние события», а очередь работы.
+            floor=self._handler_floor,
         )
         self._worker_task: asyncio.Task[None] | None = None
         self._housekeeping_task: asyncio.Task[None] | None = None
+        self._dispatcher_task: asyncio.Task[None] | None = None
 
     # --- жизненный цикл -----------------------------------------------------
 
@@ -136,8 +151,10 @@ class UserbotService:
         # Сверка выполняется после восстановления соединений: без транспорта
         # спросить сервер об исходе отправки невозможно.
         await self._worker.reconcile_stale()
+        await self._dispatcher.prepare()
         self._worker_task = asyncio.create_task(self._worker.run())
         self._housekeeping_task = asyncio.create_task(self._housekeeper.run())
+        self._dispatcher_task = asyncio.create_task(self._dispatcher.run())
 
     async def _resume(self, account: Account) -> None:
         payload = await self._storage.load_session(account.id)
@@ -163,7 +180,8 @@ class UserbotService:
     async def stop(self) -> None:
         self._worker.stop()
         self._housekeeper.stop()
-        for task in (self._worker_task, self._housekeeping_task):
+        self._dispatcher.stop()
+        for task in (self._worker_task, self._housekeeping_task, self._dispatcher_task):
             if task is None:
                 continue
             task.cancel()
@@ -376,6 +394,26 @@ class UserbotService:
     async def capabilities(self, account_id: int) -> dict[str, object]:
         await self._require_account(account_id)
         return self._capabilities(account_id).model_dump(mode="json")
+
+    # --- точка расширения ---------------------------------------------------
+
+    async def enqueue(self, account_id: int, chat_id: str, text: str, nonce: str) -> int:
+        """Отправка от имени обработчика — той же очередью, что и всё остальное.
+
+        Отдельного пути в обход очереди у обработчиков нет и не будет: лимиты,
+        идемпотентность и ручной разбор застрявшего одинаковы для человека и для
+        сценария, иначе первый же сценарий получит аккаунту блокировку.
+        """
+        item, _ = await self.enqueue_message(account_id, chat_id, text, nonce)
+        return item.id
+
+    def transport_capabilities(self, account_id: int) -> Capabilities | None:
+        """Возможности живого соединения; ``None`` — соединения сейчас нет."""
+        transport = self._connections.get(account_id)
+        return transport.capabilities if transport is not None else None
+
+    async def _handler_floor(self) -> int | None:
+        return await self._storage.handler_cursor_floor(self._registry.names)
 
     # --- вспомогательное ----------------------------------------------------
 

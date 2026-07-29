@@ -13,15 +13,22 @@ from maxub.api.routes.common import (
     get_service,
     http_error,
 )
-from maxub.api.security import require_token
+from maxub.api.security import require
 from maxub.core.models import OutboxState
+from maxub.core.permissions import Scope
 from maxub.core.service import ServiceError, ServiceNotFound, UserbotService
 from maxub.transport.base import TransportUnsupported
 
-router = APIRouter(dependencies=[Depends(require_token)])
+router = APIRouter()
+
+READ = Depends(require(Scope.MESSAGES_READ))
+# Право отправлять сообщения от лица владельца — самое дорогое в наборе:
+# получатель видит их как написанные человеком. Разбор очереди (повтор и отказ)
+# сюда же: повтор — это отправка, а отказ — окончательный отказ от неё.
+WRITE = Depends(require(Scope.MESSAGES_WRITE))
 
 
-@router.post("/send", status_code=202)
+@router.post("/send", status_code=202, dependencies=[WRITE])
 async def send(
     payload: SendRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -41,7 +48,7 @@ async def send(
     return {"queued": created, "item": item.model_dump(mode="json")}
 
 
-@router.get("/outbox")
+@router.get("/outbox", dependencies=[READ])
 async def outbox(
     state: StuckState | None = None,
     limit: int = Query(default=STUCK_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
@@ -61,7 +68,7 @@ async def outbox(
     return await service.list_stuck_messages(limit=limit, state=chosen)
 
 
-@router.post("/outbox/{item_id}/retry")
+@router.post("/outbox/{item_id}/retry", dependencies=[WRITE])
 async def retry(item_id: int, service: UserbotService = Depends(get_service)) -> dict[str, object]:
     """Повторяет отправку отказавшей записи по решению человека.
 
@@ -82,7 +89,7 @@ async def retry(item_id: int, service: UserbotService = Depends(get_service)) ->
         raise http_error(409, exc) from exc
 
 
-@router.post("/outbox/{item_id}/discard")
+@router.post("/outbox/{item_id}/discard", dependencies=[WRITE])
 async def discard(
     item_id: int, payload: DiscardRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -105,7 +112,7 @@ async def discard(
         raise http_error(409, exc) from exc
 
 
-@router.get("/history")
+@router.get("/history", dependencies=[READ])
 async def history(
     account_id: int,
     chat_id: str,

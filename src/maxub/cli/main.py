@@ -19,7 +19,7 @@ import typer
 
 from maxub.cli import errors
 from maxub.cli.client import EXIT_OK, EXIT_USAGE, ApiClient, ApiError
-from maxub.cli.commands import accounts, login, messages
+from maxub.cli.commands import accounts, login, messages, tokens
 from maxub.cli.context import Context, fail, stdout
 from maxub.config import ClientSettings, Settings
 
@@ -30,6 +30,7 @@ app = typer.Typer(
 )
 app.add_typer(accounts.app, name="accounts")
 app.add_typer(login.app, name="login")
+app.add_typer(tokens.app, name="tokens")
 
 app.command()(messages.status)
 app.command()(messages.send)
@@ -81,7 +82,11 @@ def daemon() -> None:
 
 @app.command()
 def token() -> None:
-    """Показать токен API — им пользуются клиенты внутри того же контейнера."""
+    """Показать корневой токен API — им пользуются клиенты в том же контейнере.
+
+    Корневой токен даёт все права. Скрипту, которому нужно меньше, выпускается
+    свой: `maxub tokens add --label ... --scope messages:read`.
+    """
     stdout.print(Settings().resolve_token())
 
 

@@ -279,7 +279,9 @@ def test_handoff_code_is_single_use(client: TestClient) -> None:
 def test_expired_handoff_code_is_rejected(client: TestClient) -> None:
     code = issue_code(client)
     codes: HandoffCodes = client.app.state.web_handoffs  # type: ignore[attr-defined]
-    codes._items[code] = utcnow() - timedelta(seconds=1)
+    expired, principal = codes._items[code]
+    codes._items[code] = (utcnow() - timedelta(seconds=1), principal)
+    assert expired > utcnow()
     assert SESSION_COOKIE not in enter(client, code).headers.get("set-cookie", "")
     assert client.get("/web/session").json()["authenticated"] is False
     # Просроченное не копится в памяти демона.

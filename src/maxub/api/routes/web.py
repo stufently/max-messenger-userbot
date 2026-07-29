@@ -35,9 +35,10 @@ from maxub.api.routes.common import (
 from maxub.api.routes.web_session import (
     SECURITY_HEADERS,
     require_local_host,
-    require_web_session,
+    require_web,
     secure_headers,
 )
+from maxub.core.permissions import Scope
 from maxub.core.service import ServiceError, ServiceOverloaded, UserbotService
 from maxub.transport.base import TransportUnsupported
 
@@ -92,10 +93,16 @@ async def asset(name: str) -> FileResponse:
 
 # --- операции страницы -------------------------------------------------------
 
-api = APIRouter(prefix="/api", dependencies=[Depends(require_web_session)])
+# Права проверяются по сессии на каждом маршруте: панель не имеет права больше,
+# чем токен, которым её открыли. Общая зависимость на роутере выдала бы всем
+# маршрутам самое широкое право из набора.
+api = APIRouter(prefix="/api")
+
+STATE = Depends(require_web(Scope.ACCOUNTS_READ))
+MANAGE = Depends(require_web(Scope.ACCOUNTS_WRITE))
 
 
-@api.get("/state")
+@api.get("/state", dependencies=[STATE])
 async def state(service: UserbotService = Depends(get_service)) -> dict[str, object]:
     """Состояние одним запросом: страница опрашивает его периодически.
 
@@ -109,7 +116,7 @@ async def state(service: UserbotService = Depends(get_service)) -> dict[str, obj
     }
 
 
-@api.post("/accounts", status_code=201)
+@api.post("/accounts", status_code=201, dependencies=[MANAGE])
 async def add_account(
     payload: AddAccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -120,7 +127,7 @@ async def add_account(
     return account.model_dump(mode="json")
 
 
-@api.post("/accounts/{account_id}/disable")
+@api.post("/accounts/{account_id}/disable", dependencies=[MANAGE])
 async def disable_account(
     account_id: int, payload: DisableRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -131,7 +138,7 @@ async def disable_account(
     return account.model_dump(mode="json")
 
 
-@api.post("/login/start")
+@api.post("/login/start", dependencies=[MANAGE])
 async def login_start(
     payload: AccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, str]:
@@ -143,7 +150,7 @@ async def login_start(
         raise http_error(404, exc) from exc
 
 
-@api.post("/login/complete")
+@api.post("/login/complete", dependencies=[MANAGE])
 async def login_complete(
     payload: LoginCompleteRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -154,7 +161,7 @@ async def login_complete(
     return account.model_dump(mode="json")
 
 
-@api.post("/login/qr/start")
+@api.post("/login/qr/start", dependencies=[MANAGE])
 async def login_qr_start(
     payload: AccountRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:
@@ -169,7 +176,7 @@ async def login_qr_start(
     return {**challenge, "image": qr_data_uri(str(challenge["payload"]))}
 
 
-@api.post("/login/qr/poll")
+@api.post("/login/qr/poll", dependencies=[MANAGE])
 async def login_qr_poll(
     payload: ChallengeRequest, service: UserbotService = Depends(get_service)
 ) -> dict[str, object]:

@@ -49,13 +49,16 @@ CSRF. Одной cookie мало: демон слушает localhost, и люб
 from __future__ import annotations
 
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
+from maxub.core.access import AccessControl, Principal
 from maxub.core.models import utcnow
+from maxub.core.permissions import Scope, format_scopes
 
 SESSION_COOKIE = "maxub_web"
 SESSION_TTL = timedelta(hours=12)
@@ -86,8 +89,17 @@ SECURITY_HEADERS = {
 
 @dataclass(slots=True)
 class WebSession:
+    """Сессия браузера вместе с тем, чьи права она несёт.
+
+    Права хранятся не значением, а ссылкой на предъявителя: слепок прав жил бы
+    до конца срока сессии, и отозванный час назад токен продолжал бы работать
+    через открытую вкладку. Перед каждым защищённым запросом предъявитель
+    перепроверяется, см. `require_web`.
+    """
+
     csrf: str
     expires_at: datetime
+    principal: Principal
 
 
 class SessionRequest(BaseModel):
@@ -157,7 +169,7 @@ def same_secret(provided: str, expected: str) -> bool:
     return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
-async def require_web_session(request: Request) -> None:
+async def require_web_session(request: Request) -> WebSession:
     """Пускает только с живой сессией, а изменяющие запросы — ещё и с CSRF."""
     session = _current(request)
     if session is None:
@@ -166,9 +178,47 @@ async def require_web_session(request: Request) -> None:
         provided = request.headers.get("x-csrf-token") or ""
         if not same_secret(provided, session.csrf):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="нет метки CSRF")
+    return session
 
 
-def issue_session(request: Request, response: Response) -> WebSession:
+def require_web(*scopes: Scope) -> Callable[..., Awaitable[Principal]]:
+    """Зависимость страницы: живая сессия, метка CSRF и нужные права.
+
+    Панель — такой же клиент API, как CLI, и права у неё те же, что у токена,
+    которым её открыли. Проверять их обязательно здесь, а не только на
+    bearer-маршрутах: иначе токен с правом читать, введённый в форму входа,
+    получил бы через панель и вход в аккаунт, и отправку.
+
+    Предъявитель перечитывается на каждом запросе: отозванный токен закрывает
+    сессию сразу, а урезанные права действуют с того же мгновения.
+    """
+
+    async def dependency(
+        request: Request, session: WebSession = Depends(require_web_session)
+    ) -> Principal:
+        access: AccessControl = request.app.state.access
+        principal = await access.refresh(session.principal)
+        if principal is None:
+            sid = request.cookies.get(SESSION_COOKIE)
+            if sid:
+                _store(request).pop(sid, None)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="токен, которым открыта панель, отозван или просрочен",
+            )
+        session.principal = principal
+        missing = principal.missing(scopes)
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"токену не хватает прав: {', '.join(scope.value for scope in missing)}",
+            )
+        return principal
+
+    return dependency
+
+
+def issue_session(request: Request, response: Response, principal: Principal) -> WebSession:
     """Заводит сессию браузера и кладёт её идентификатор в cookie.
 
     Общее место для обоих входов — формы с токеном и одноразового кода из
@@ -184,7 +234,9 @@ def issue_session(request: Request, response: Response) -> WebSession:
     while len(store) >= MAX_SESSIONS:
         del store[next(iter(store))]
     sid = secrets.token_urlsafe(32)
-    session = WebSession(csrf=secrets.token_urlsafe(32), expires_at=now + SESSION_TTL)
+    session = WebSession(
+        csrf=secrets.token_urlsafe(32), expires_at=now + SESSION_TTL, principal=principal
+    )
     store[sid] = session
     response.set_cookie(
         SESSION_COOKIE,
@@ -201,26 +253,53 @@ def issue_session(request: Request, response: Response) -> WebSession:
 @router.post("/session")
 async def open_session(
     payload: SessionRequest, request: Request, response: Response
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Меняет токен демона на сессию браузера.
 
     Вход по токену остаётся основным: панель открывают и из Docker, где нет ни
     лаунчера, ни одноразового кода, и токен там вводят руками.
 
+    Панель открывается любым годным токеном, а не только корневым: права сессии
+    равны правам этого токена, и владелец вправе открыть панель ограниченным
+    токеном ровно для того, чтобы она умела меньше.
+
     Перебор токена смысла не имеет: это 256 случайных бит, а демон доступен
     только с петлевого интерфейса — отдельный счётчик попыток избыточен.
     """
-    expected: str = request.app.state.api_token
-    if not same_secret(payload.token.strip(), expected):
+    access: AccessControl = request.app.state.access
+    principal = await access.authenticate(payload.token)
+    if principal is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="неверный токен")
-    return {"csrf": issue_session(request, response).csrf}
+    session = issue_session(request, response, principal)
+    return {"csrf": session.csrf, "scopes": format_scopes(principal.scopes)}
 
 
 @router.get("/session")
 async def session_info(request: Request) -> dict[str, object]:
-    """Позволяет странице после перезагрузки узнать, что вход ещё жив."""
+    """Позволяет странице после перезагрузки узнать, что вход ещё жив.
+
+    Права возвращаются вместе с меткой CSRF: страница по ним прячет то, чего
+    этой сессии всё равно нельзя, — не как защиту (защита на сервере), а чтобы
+    не предлагать кнопку, которая ответит отказом.
+    """
     session = _current(request)
-    return {"authenticated": session is not None, "csrf": session.csrf if session else None}
+    if session is None:
+        return {"authenticated": False, "csrf": None, "scopes": ""}
+    # Предъявитель перепроверяется и здесь: иначе страница после отзыва токена
+    # показывала бы вход живым и упиралась бы в отказ на первом же действии.
+    access: AccessControl = request.app.state.access
+    principal = await access.refresh(session.principal)
+    if principal is None:
+        sid = request.cookies.get(SESSION_COOKIE)
+        if sid:
+            _store(request).pop(sid, None)
+        return {"authenticated": False, "csrf": None, "scopes": ""}
+    session.principal = principal
+    return {
+        "authenticated": True,
+        "csrf": session.csrf,
+        "scopes": format_scopes(principal.scopes),
+    }
 
 
 @router.delete("/session", dependencies=[Depends(require_web_session)])

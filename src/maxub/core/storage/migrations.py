@@ -126,6 +126,48 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE outbox ADD COLUMN discarded_at TEXT",
         ),
     ),
+    Migration(
+        version=4,
+        summary="токены API с областями доступа и курсоры обработчиков",
+        statements=(
+            # Сам токен не хранится нигде: в базе лежит его отпечаток. Копия
+            # базы поэтому не даёт доступа к API, а показать выданный токен
+            # второй раз демон не может даже владельцу.
+            #
+            # Отпечаток — обычный SHA-256, без argon2 и bcrypt. Те защищают
+            # пароли, придуманные человеком: там мало энтропии и перебор
+            # осмыслен. Здесь секрет — 32 случайных байта от самого демона,
+            # перебирать нечего, а KDF на каждом запросе стоил бы миллисекунд
+            # на ровном месте.
+            """
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                label        TEXT NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                scopes       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT,
+                last_used_at TEXT,
+                revoked_at   TEXT
+            )
+            """,
+            # Позиция обработчика в журнале событий. Своя строка на обработчика,
+            # а не одна общая: медленный обработчик не должен тормозить
+            # остальных, а добавленный позже — не должен получать чужой курсор.
+            #
+            # `attempts` считает неудачные подходы к одному и тому же событию:
+            # без счётчика повтор был бы вечным, а без повтора вовсе — первая же
+            # ошибка означала бы потерю события.
+            """
+            CREATE TABLE IF NOT EXISTS handler_cursors (
+                name       TEXT PRIMARY KEY,
+                after_id   INTEGER NOT NULL,
+                attempts   INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

@@ -68,11 +68,13 @@ class FakeJournal:
 
     def __init__(self, fail_times: int = 0) -> None:
         self.calls: list[datetime] = []
+        self.floors: list[int | None] = []
         self.called = asyncio.Event()
         self._fail_times = fail_times
 
-    async def prune_events(self, older_than: datetime) -> int:
+    async def prune_events(self, older_than: datetime, keep_from_id: int | None = None) -> int:
         self.calls.append(older_than)
+        self.floors.append(keep_from_id)
         self.called.set()
         if self._fail_times > 0:
             self._fail_times -= 1

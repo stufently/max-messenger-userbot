@@ -60,7 +60,23 @@ class EventsMixin(Database):
             rows = await cursor.fetchall()
         return [(row["id"], self._event(row)) for row in rows]
 
-    async def prune_events(self, older_than: datetime) -> int:
+    async def first_event_id(self) -> int | None:
+        """Идентификатор самого старого сохранившегося события."""
+        async with self.db.execute("SELECT MIN(id) AS oldest FROM events") as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["oldest"] is None:
+            return None
+        return int(row["oldest"])
+
+    async def last_event_id(self) -> int:
+        """Идентификатор последнего события; 0 — журнал пуст."""
+        async with self.db.execute("SELECT MAX(id) AS newest FROM events") as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["newest"] is None:
+            return 0
+        return int(row["newest"])
+
+    async def prune_events(self, older_than: datetime, keep_from_id: int | None = None) -> int:
         """Удаляет события старше указанного момента, возвращает их число.
 
         Сравнение идёт по строке, а не по разобранной дате: `created_at` всегда
@@ -71,12 +87,20 @@ class EventsMixin(Database):
 
         Курсор `after_id` от подрезки не страдает: идентификаторы растут и не
         переиспользуются, поэтому клиент, стоящий на старом `id`, просто
-        получит следующие сохранившиеся события, а не начнёт сначала.
+        получит следующие сохранившиеся события, а не начнёт сначала. Это верно
+        для того, кто читает журнал сам и волен пропустить удалённое. Для
+        обработчика событий — нет: он обязан увидеть каждое своё событие, и
+        уборка, обогнавшая его курсор, молча съела бы работу. Поэтому
+        ``keep_from_id`` задаёт границу, за которую уборка не заходит, — самую
+        отстающую позицию среди подключённых обработчиков.
         """
+        query = "DELETE FROM events WHERE created_at < ?"
+        params: list[object] = [older_than.isoformat()]
+        if keep_from_id is not None:
+            query += " AND id <= ?"
+            params.append(keep_from_id)
         async with self.write() as db:
-            cursor = await db.execute(
-                "DELETE FROM events WHERE created_at < ?", (older_than.isoformat(),)
-            )
+            cursor = await db.execute(query, tuple(params))
         return int(cursor.rowcount)
 
     @staticmethod

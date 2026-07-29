@@ -19,10 +19,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 from maxub.core.models import utcnow
 from maxub.core.ports import EventJournal
+
+#: Самая отстающая позиция обработчиков: дальше неё уборка не заходит.
+#: ``None`` — обработчиков нет, журнал принадлежит только читателям.
+CursorFloor = Callable[[], Awaitable[int | None]]
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +35,17 @@ log = logging.getLogger(__name__)
 class Housekeeper:
     """Периодически подрезает журнал событий."""
 
-    def __init__(self, storage: EventJournal, retention_days: int, interval_seconds: float) -> None:
+    def __init__(
+        self,
+        storage: EventJournal,
+        retention_days: int,
+        interval_seconds: float,
+        floor: CursorFloor | None = None,
+    ) -> None:
         self._storage = storage
         self._retention_days = retention_days
         self._interval = interval_seconds
+        self._floor = floor
         self._stopping = asyncio.Event()
 
     def stop(self) -> None:
@@ -56,7 +68,11 @@ class Housekeeper:
             return
         older_than = utcnow() - timedelta(days=self._retention_days)
         try:
-            removed = await self._storage.prune_events(older_than)
+            # Граница обработчиков берётся перед самой уборкой, а не при сборке:
+            # курсоры двигаются всё время работы демона, а уборка происходит раз
+            # в сутки — значение, взятое заранее, к этому моменту устареет.
+            keep_from_id = await self._floor() if self._floor is not None else None
+            removed = await self._storage.prune_events(older_than, keep_from_id)
         except asyncio.CancelledError:
             raise
         except Exception:

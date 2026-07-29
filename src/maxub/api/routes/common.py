@@ -6,9 +6,10 @@ from enum import StrEnum
 from typing import Annotated
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from maxub.core.models import OutboxState
+from maxub.core.permissions import Scope, parse_scopes
 from maxub.core.service import UserbotService
 
 # Верхние границы отсекают запросы, способные раздуть БД или память демона.
@@ -18,6 +19,10 @@ MAX_PAGE_SIZE = 500
 # Причина отказа читается человеком в таблице очереди: несколько строк текста
 # помещаются, пересказ переписки — нет.
 MAX_REASON_LENGTH = 500
+
+# Потолок срока жизни токена: десять лет — это уже «бессрочно», но записанное
+# числом, и опечатку в нём видно сразу.
+MAX_EXPIRY_DAYS = 3650
 
 # Разбор застрявших записей — работа глазами: страница по умолчанию короче
 # предельной, чтобы человек видел список целиком, а не его хвост.
@@ -83,6 +88,35 @@ class DiscardRequest(BaseModel):
 
 class DisableRequest(BaseModel):
     reason: str = Field(default="остановлен вручную", max_length=MAX_LABEL_LENGTH)
+
+
+class IssueTokenRequest(BaseModel):
+    """Заявка на выпуск токена API.
+
+    Метка обязательна и не может быть пустой: список токенов без меток — это
+    список чисел, по которому невозможно решить, какой из них пора отозвать.
+    Область доступа хотя бы одна: токен без прав ничего не открывает, а выглядит
+    как рабочий.
+    """
+
+    label: Annotated[str, StringConstraints(strip_whitespace=True)] = Field(
+        min_length=1, max_length=MAX_LABEL_LENGTH
+    )
+    scopes: list[str] = Field(min_length=1, max_length=len(Scope))
+    # Верхняя граница — десять лет: срок в столетиях означает опечатку, а не
+    # намерение. Отсутствие срока разрешено явно, для токена «пока не отзову».
+    expires_in_days: int | None = Field(default=None, ge=1, le=MAX_EXPIRY_DAYS)
+
+    def parsed_scopes(self) -> frozenset[Scope]:
+        return parse_scopes(self.scopes)
+
+    @field_validator("scopes")
+    @classmethod
+    def _known(cls, values: list[str]) -> list[str]:
+        # Разбор на границе: неизвестная область должна отвечать 422 с внятным
+        # текстом, а не выпускать токен без части заявленных прав.
+        parse_scopes(values)
+        return values
 
 
 def get_service(request: Request) -> UserbotService:
