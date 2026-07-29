@@ -4,7 +4,7 @@
 # Digest снят с фактически скачанного образа (`docker buildx imagetools inspect`)
 # и указывает на манифест-список, то есть остаётся верным и на amd64, и на arm64.
 # Тег рядом — чтобы при обновлении было видно, что именно закреплено.
-FROM python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+FROM python@sha256:5f1cdbcab9a50594a79502dd73e885456d2a2fc31f1a1fa18484815b37ee9152
 # python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
