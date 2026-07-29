@@ -77,6 +77,30 @@ class DeliveryMixin(EventsMixin):
                 (OutboxState.QUEUED.value, item_id, OutboxState.CLAIMED.value),
             )
 
+    async def defer_claimed(self, item_id: int, until: datetime) -> None:
+        """Откладывает захваченную запись, не засчитывая попытку.
+
+        Отличается от [release_claimed][maxub.core.storage.delivery.DeliveryMixin.release_claimed]
+        двумя вещами, и обе существенны. Во-первых, задаётся срок: запись не
+        должна вернуться в работу раньше, чем истечёт лимит, — иначе воркер
+        забирал бы её по кругу каждые полсекунды. Во-вторых, счётчик попыток
+        откатывается: его увеличил захват, а попытки отправки не было. Без
+        отката сообщение, попавшее под долгий штраф, исчерпало бы лимит попыток,
+        так и не побывав в сети ни разу.
+        """
+        async with self.write() as db:
+            await db.execute(
+                "UPDATE outbox"
+                " SET state = ?, next_attempt_at = ?, attempts = MAX(attempts - 1, 0)"
+                " WHERE id = ? AND state = ?",
+                (
+                    OutboxState.QUEUED.value,
+                    until.isoformat(),
+                    item_id,
+                    OutboxState.CLAIMED.value,
+                ),
+            )
+
     async def release_all_claimed(self) -> int:
         """Возвращает в очередь всё, что осталось захваченным после падения.
 

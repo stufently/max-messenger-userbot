@@ -128,6 +128,16 @@ class OutboxWorker:
         if transport is None:
             await self._retry_or_fail(item, "нет активного соединения")
             return
+        wait = self._limiter.wait_estimate(item.account_id, SEND_ACTION)
+        if wait > self._settings.limit_wait_threshold_seconds:
+            # Долгое ожидание не высиживается на месте. Воркер один на все
+            # аккаунты, и штраф сервера по одному из них — хоть на час —
+            # остановил бы отправку у всех остальных, а захваченный остаток
+            # пачки провисел бы в claimed всё это время. Запись возвращается в
+            # очередь со сроком, воркер идёт дальше.
+            await self._repo.defer_claimed(item.id, utcnow() + timedelta(seconds=wait))
+            log.info("отправка %s отложена на %.0f с: действует лимит", item.id, wait)
+            return
         await self._limiter.acquire(item.account_id, SEND_ACTION)
         # Отметка ставится вплотную к сетевому вызову: всё, что до неё, точно
         # не дошло до сервера и повторяется без сверки.
@@ -139,9 +149,14 @@ class OutboxWorker:
         try:
             remote_id = await transport.send_text(item.chat_id, item.text, item.idempotency_key)
         except TransportRateLimited as exc:
-            if exc.retry_after:
-                until = self._limiter.penalize(item.account_id, SEND_ACTION, exc.retry_after)
-                await self._repo.save_penalty(item.account_id, SEND_ACTION, until)
+            # Сервер мог отказать по лимиту и не сказать, насколько. Считать это
+            # за «штрафа нет» нельзя: остаётся общий backoff в несколько секунд,
+            # то есть демон возвращается ровно туда, откуда его только что
+            # прогнали. Запасное значение консервативное — лучше подождать
+            # лишнее, чем получить второй отказ подряд.
+            retry_after = exc.retry_after or self._settings.rate_limit_fallback_seconds
+            until = self._limiter.penalize(item.account_id, SEND_ACTION, retry_after)
+            await self._repo.save_penalty(item.account_id, SEND_ACTION, until)
             await self._retry_or_fail(item, str(exc))
             return
         except TransportNotApplied as exc:

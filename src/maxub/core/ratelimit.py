@@ -60,14 +60,29 @@ class RateLimiter:
         self._jitter = jitter_seconds
         self._buckets: dict[tuple[int, str], TokenBucket] = {}
         self._penalty: dict[tuple[int, str], datetime] = {}
+        self._locks: dict[tuple[int, str], asyncio.Lock] = {}
 
-    def _bucket(self, account_id: int, action: str) -> TokenBucket:
-        key = (account_id, action)
+    def _bucket(self, key: tuple[int, str]) -> TokenBucket:
         bucket = self._buckets.get(key)
         if bucket is None:
             bucket = TokenBucket(rate_per_minute=self._rate, burst=self._burst)
             self._buckets[key] = bucket
         return bucket
+
+    def _lock(self, key: tuple[int, str]) -> asyncio.Lock:
+        """Замок на ключ: разрешение выдаётся по одному.
+
+        Без него два одновременных вызова на одно ведро оба видят свободный
+        токен, оба спят и оба списывают — лимит обходится ровно в момент, когда
+        он нужнее всего. Сегодня потребитель один и последовательный, но лимит —
+        это защита аккаунта от блокировки, и держаться она должна на замке, а не
+        на текущем расположении вызовов.
+        """
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
     def penalize(self, account_id: int, action: str, retry_after: float) -> datetime:
         """Учитывает ``retry_after`` от сервера — он всегда важнее нашего лимита.
@@ -81,6 +96,28 @@ class RateLimiter:
         self._penalty[key] = max(current, until) if current else until
         return self._penalty[key]
 
+    def penalty_until(self, account_id: int, action: str) -> datetime | None:
+        """Действующий штраф по ключу — ``None``, если его нет."""
+        return self._penalty.get((account_id, action))
+
+    def wait_estimate(self, account_id: int, action: str) -> float:
+        """Сколько секунд заняло бы разрешение, если запросить его сейчас.
+
+        Ничего не расходует и никого не задерживает. Нужна вызывающему, чтобы
+        выбрать между «подождать здесь» и «вернуть работу в очередь и заняться
+        другим аккаунтом»: [acquire][maxub.core.ratelimit.RateLimiter.acquire]
+        такого выбора не оставляет — она просто спит.
+
+        Это оценка, а не обещание: пока вызывающий думает, штраф может
+        продлиться, а токен — уйти соседу.
+        """
+        key = (account_id, action)
+        wait = 0.0
+        penalty_until = self._penalty.get(key)
+        if penalty_until is not None:
+            wait = max(0.0, (penalty_until - utcnow()).total_seconds())
+        return wait + self._bucket(key).delay_for_next()
+
     def restore(self, account_id: int, action: str, until: datetime) -> None:
         """Возвращает штраф, сохранённый до перезапуска."""
         if until > utcnow():
@@ -88,17 +125,37 @@ class RateLimiter:
 
     async def acquire(self, account_id: int, action: str) -> None:
         key = (account_id, action)
-        penalty_until = self._penalty.get(key)
-        if penalty_until is not None:
-            remaining = (penalty_until - utcnow()).total_seconds()
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-            self._penalty.pop(key, None)
+        async with self._lock(key):
+            await self._serve_penalty(key)
+            bucket = self._bucket(key)
+            # Ожидание в цикле, а не однократное: после сна ведро пересчитывается
+            # по часам, а не списывается вслепую. На установившемся ритме разницы
+            # нет — слепое списание уводит баланс в минус ровно на столько, на
+            # сколько следующий пересчёт его вернёт. Разница появляется там, где
+            # сон оказался длиннее рассчитанного: под нагрузкой цикл событий
+            # будит корутину позже, и списывать по устаревшему расчёту значит
+            # накапливать долг, которого не было.
+            while True:
+                delay = bucket.delay_for_next()
+                if delay <= 0:
+                    break
+                await asyncio.sleep(delay)
+            if self._jitter > 0:
+                await asyncio.sleep(random.uniform(0, self._jitter))
+            bucket.consume()
 
-        bucket = self._bucket(account_id, action)
-        delay = bucket.delay_for_next()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        if self._jitter > 0:
-            await asyncio.sleep(random.uniform(0, self._jitter))
-        bucket.consume()
+    async def _serve_penalty(self, key: tuple[int, str]) -> None:
+        """Досиживает штраф, назначенный сервером.
+
+        Штраф мог быть продлён, пока мы спали, поэтому проверка повторяется до
+        тех пор, пока времени не останется.
+        """
+        while True:
+            penalty_until = self._penalty.get(key)
+            if penalty_until is None:
+                return
+            remaining = (penalty_until - utcnow()).total_seconds()
+            if remaining <= 0:
+                self._penalty.pop(key, None)
+                return
+            await asyncio.sleep(remaining)
