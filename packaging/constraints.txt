@@ -96,7 +96,7 @@ markdown-it-py==4.2.0
 mdurl==0.1.2
 packaging==26.2
 pycparser==3.0
-pydantic-core==2.46.4
+pydantic-core==2.47.0
 Pygments==2.20.0
 python-dotenv==1.2.2
 shellingham==1.5.4
