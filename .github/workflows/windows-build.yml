@@ -32,6 +32,19 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # Весь текст в проекте русский, а Windows-Python, чей вывод уходит в пайп (а
+    # на раннере он уходит именно туда), берёт кодировку из ANSI-кодовой
+    # страницы системы. У раннера GitHub это cp1252, куда кириллица не
+    # переводится вовсе, — и любое сообщение по-русски заканчивалось не текстом,
+    # а `UnicodeEncodeError`. Так и падал прогон: ошибку печатала проверка ниже,
+    # причём на строке об успехе.
+    #
+    # Сама проверка защищена от этого изнутри (`check_bundle.py` перенастраивает
+    # свой вывод), но по-русски говорит не только она: спека печатает отказ,
+    # когда в окружении сборки нет библиотеки транспорта, и без этой переменной
+    # вместо объяснения пользователь увидел бы ошибку кодировки.
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       # Только официальные actions/*, версия закреплена по SHA: тег может быть
       # переставлен на другой коммит, и в сборку приедет чужой код.
@@ -73,52 +86,16 @@ jobs:
         run: Get-ChildItem dist
 
       - name: Check the transport library is inside the exe
-        # Успешная сборка сама по себе ничего не доказывает: exe без транспорта
-        # выглядит ровно так же и весит почти столько же, а упрётся в
-        # `ModuleNotFoundError` только у пользователя, выбравшего
-        # `MAXUB_TRANSPORT=pymax`, — то есть там, где доложить недостающее
-        # нечем. Отказ спеки (`SystemExit`) закрывает лишь случай «библиотеки в
-        # окружении сборки нет вовсе»; здесь проверяется то, что важно на самом
-        # деле, — что в архив попал ВЕСЬ пакет, а не сколько-то его модулей.
+        # Что именно проверяется и почему этого не видно по успешной сборке —
+        # в самом скрипте. Здесь он вызывается файлом, а не heredoc-ом: ровно
+        # ту же проверку выполняет локальная сборка под Wine, и разъехаться они
+        # не должны.
         #
-        # Сравнение с установленным пакетом, а не со списком имён: список
-        # устарел бы при первом же обновлении библиотеки и начал бы врать в
-        # обратную сторону — молча пропускать пропажу новых модулей.
-        #
-        # bash, а не PowerShell по умолчанию: на раннере он есть, а heredoc
-        # избавляет от экранирования кавычек внутри YAML.
+        # bash, а не PowerShell по умолчанию: PowerShell перекодирует вывод
+        # вызванной программы по кодовой странице консоли, и русский текст в
+        # журнале превратился бы в кашу; bash отдаёт байты как есть.
         shell: bash
-        run: |
-          python - dist/maxub.exe dist/maxubctl.exe <<'PY'
-          import importlib
-          import os
-          import pkgutil
-          import sys
-          import tempfile
-
-          from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
-
-          PACKAGE = "pymax"
-          module = importlib.import_module(PACKAGE)
-          on_disk = {PACKAGE} | {
-              name for _, name, _ in pkgutil.walk_packages(module.__path__, PACKAGE + ".")
-          }
-
-          for exe in sys.argv[1:]:
-              reader = CArchiveReader(exe)
-              # Чистый Python лежит не в самом архиве exe, а во вложенном PYZ:
-              # искать `pymax` в `reader.toc` бесполезно, там только бинарники
-              # и данные.
-              pyz = next(name for name in reader.toc if name.lower().endswith(".pyz"))
-              path = os.path.join(tempfile.gettempdir(), "maxub-pyz-check.pyz")
-              with open(path, "wb") as handle:
-                  handle.write(reader.extract(pyz))
-              bundled = set(ZlibArchiveReader(path).toc)
-              missing = sorted(on_disk - bundled)
-              if missing:
-                  sys.exit(f"{exe}: в сборке не хватает модулей {PACKAGE}: {missing}")
-              print(f"{exe}: {PACKAGE} целиком, {len(on_disk)} модулей")
-          PY
+        run: python packaging/windows/check_bundle.py dist/maxub.exe dist/maxubctl.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

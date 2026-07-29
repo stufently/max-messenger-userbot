@@ -11,6 +11,7 @@ DIST_DIR="${MAXUB_DIST_DIR:-/repo/dist/windows}"
 # на время сборки и не должен оседать в дереве пользователя.
 WORK_DIR="${TMPDIR:-/tmp}/maxub-pyinstaller"
 SPEC="/repo/packaging/windows/maxub.spec"
+CHECK="/repo/packaging/windows/check_bundle.py"
 
 mkdir -p "$DIST_DIR" "$WORK_DIR"
 
@@ -26,6 +27,15 @@ xvfb-run -a wine "$WINEPYTHON" -m PyInstaller \
 
 # Ждём, пока Wine отпустит собранные файлы: без этого следующая сборка
 # спотыкается о ещё живой процесс.
+wineserver -w
+
+# Тот же скрипт, что зовёт CI: собранный exe без библиотеки транспорта выглядит
+# исправным и почти столько же весит, а падает только у пользователя. Проверка
+# идёт и здесь, а не только на раннере, потому что расхождение между локальной
+# сборкой и релизной — ровно та ошибка, которую эта сборка призвана исключать.
+wine "$WINEPYTHON" "$(winepath -w "$CHECK")" \
+    "$(winepath -w "$DIST_DIR/maxub.exe")" \
+    "$(winepath -w "$DIST_DIR/maxubctl.exe")" 2>&1
 wineserver -w
 
 ls -l "$DIST_DIR"
