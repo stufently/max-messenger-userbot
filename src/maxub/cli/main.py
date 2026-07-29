@@ -33,6 +33,8 @@ app.add_typer(login.app, name="login")
 
 app.command()(messages.status)
 app.command()(messages.send)
+app.command()(messages.outbox)
+app.command()(messages.retry)
 app.command()(messages.history)
 app.command()(messages.events)
 app.command()(messages.capabilities)

@@ -21,6 +21,12 @@ XSS на странице отдала бы полный контроль над
 3. Сам токен в браузере не сохраняется: он уходит один раз в теле запроса.
    Сессия живёт в памяти процесса и умирает вместе с ним.
 
+У шага 1 есть замена для автономной сборки под Windows, где браузер открывает
+сам лаунчер: одноразовый код входа, см.
+[web_handoff][maxub.api.routes.web_handoff]. Дальше всё то же самое — та же
+cookie, та же метка CSRF; вход по токену в форму никуда не девается, потому что
+в Docker лаунчера нет вовсе.
+
 CSRF. Одной cookie мало: демон слушает localhost, и любая открытая в том же
 браузере страница может отправить на него запрос. Защита двойная — cookie с
 ``SameSite=Strict`` вообще не прикладывается к межсайтовым запросам, а каждый
@@ -162,18 +168,14 @@ async def require_web_session(request: Request) -> None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="нет метки CSRF")
 
 
-@router.post("/session")
-async def open_session(
-    payload: SessionRequest, request: Request, response: Response
-) -> dict[str, str]:
-    """Меняет токен демона на сессию браузера.
+def issue_session(request: Request, response: Response) -> WebSession:
+    """Заводит сессию браузера и кладёт её идентификатор в cookie.
 
-    Перебор токена смысла не имеет: это 256 случайных бит, а демон доступен
-    только с петлевого интерфейса — отдельный счётчик попыток избыточен.
+    Общее место для обоих входов — формы с токеном и одноразового кода из
+    [web_handoff][maxub.api.routes.web_handoff]. Правила хранения cookie должны
+    быть ровно одни: разъехавшись в мелочи вроде `SameSite` или `Path`, второй
+    вход тихо ослабил бы первый.
     """
-    expected: str = request.app.state.api_token
-    if not same_secret(payload.token.strip(), expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="неверный токен")
     store = _store(request)
     now = utcnow()
     for sid, item in list(store.items()):
@@ -193,7 +195,25 @@ async def open_session(
         secure=request.url.scheme == "https",
         path="/web",
     )
-    return {"csrf": session.csrf}
+    return session
+
+
+@router.post("/session")
+async def open_session(
+    payload: SessionRequest, request: Request, response: Response
+) -> dict[str, str]:
+    """Меняет токен демона на сессию браузера.
+
+    Вход по токену остаётся основным: панель открывают и из Docker, где нет ни
+    лаунчера, ни одноразового кода, и токен там вводят руками.
+
+    Перебор токена смысла не имеет: это 256 случайных бит, а демон доступен
+    только с петлевого интерфейса — отдельный счётчик попыток избыточен.
+    """
+    expected: str = request.app.state.api_token
+    if not same_secret(payload.token.strip(), expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="неверный токен")
+    return {"csrf": issue_session(request, response).csrf}
 
 
 @router.get("/session")

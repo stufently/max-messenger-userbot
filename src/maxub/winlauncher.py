@@ -28,11 +28,11 @@ from maxub.daemon import serve
 from maxub.winhost import (
     acquire_single_instance,
     configure_logging,
-    copy_token_to_clipboard,
     default_data_dir,
     drop_runtime,
     pick_free_port,
     probe_health,
+    request_handoff_code,
     running_instance,
     show_error,
     write_runtime,
@@ -49,27 +49,36 @@ log = logging.getLogger(__name__)
 # Здесь собрано всё, что зависит от чужого модуля, чтобы его правка сводилась к
 # одному месту в лаунчере.
 #
-# На момент написания: страница отдаётся по `GET /web`, а вход браузера — это
-# `POST /web/session` с токеном в теле запроса (см. web_session.py: токен
-# намеренно не кладётся в JavaScript и не ходит в адресной строке, иначе он
-# оседал бы в истории браузера). Значит, передать токен через URL нельзя, и
-# лаунчер кладёт его в буфер обмена — пользователю остаётся вставить его в
-# форму. Если в web.py появится приём токена из адреса, достаточно задать имя
-# параметра ниже и убрать вызов `copy_token_to_clipboard`.
+# На момент написания: страница отдаётся по `GET /web`, обладатель токена демона
+# получает одноразовый код входа по `POST /web/handoff`, а переход на
+# `GET /web/enter?code=...` меняет код на сессию браузера и перенаправляет на
+# саму страницу (см. web_handoff.py). Сам токен в браузер не передаётся ни через
+# адрес, ни через буфер обмена: код живёт минуты и гаснет при первом же
+# переходе, а токен — бессрочно.
+#
+# Если демон код не выдал (панель выключена настройкой, версии разошлись),
+# открывается просто `/web`: вход по токену в форму никуда не делся.
 #
 # `require_local_host` в панели требует петлевой `Host`; лаунчер открывает
 # 127.0.0.1, так что это условие выполняется.
 WEB_PAGE_PATH = "/web"
+WEB_ENTER_PATH = "/web/enter"
+HANDOFF_PATH = "/web/handoff"
 HEALTH_PATH = "/health"
-TOKEN_QUERY_PARAM: str | None = None
+CODE_QUERY_PARAM = "code"
 
 
-def web_url(base_url: str, token: str) -> str:
+def web_url(base_url: str, code: str | None = None) -> str:
     """Адрес панели, который открывается в браузере."""
-    if TOKEN_QUERY_PARAM:
-        query = urllib.parse.urlencode({TOKEN_QUERY_PARAM: token})
-        return f"{base_url}{WEB_PAGE_PATH}?{query}"
+    if code:
+        query = urllib.parse.urlencode({CODE_QUERY_PARAM: code})
+        return f"{base_url}{WEB_ENTER_PATH}?{query}"
     return f"{base_url}{WEB_PAGE_PATH}"
+
+
+def panel_url(base_url: str, token: str) -> str:
+    """Адрес панели с одноразовым кодом входа, если демон его выдал."""
+    return web_url(base_url, request_handoff_code(base_url, HANDOFF_PATH, token))
 
 
 def build_settings() -> Settings:
@@ -114,9 +123,10 @@ def _open_panel(settings: Settings, base_url: str, token: str) -> None:
         show_error("Демон не запустился. Подробности — в файле launcher.log.")
         return
     write_runtime(settings.data_dir, base_url)
-    copied = copy_token_to_clipboard(token)
-    log.info("панель: %s (токен в буфере обмена: %s)", web_url(base_url, token), copied)
-    webbrowser.open(web_url(base_url, token))
+    # В журнал идёт адрес без кода: файл журнала переживает сессию, а код —
+    # это готовый вход в панель, пусть и на две минуты.
+    log.info("панель: %s%s", base_url, WEB_PAGE_PATH)
+    webbrowser.open(panel_url(base_url, token))
 
 
 def main() -> int:
@@ -133,8 +143,7 @@ def main() -> int:
     if existing:
         log.info("экземпляр уже работает на %s, открываю панель", existing)
         token = settings.resolve_token()
-        copy_token_to_clipboard(token)
-        webbrowser.open(web_url(existing, token))
+        webbrowser.open(panel_url(existing, token))
         return 0
     # Замок берётся до создания секретов: два первых запуска иначе оба увидели
     # бы пустой каталог и полезли создавать токен наперегонки.

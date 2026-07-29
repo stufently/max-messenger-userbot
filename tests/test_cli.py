@@ -92,6 +92,43 @@ def test_full_flow_outputs_json(api: TestClient, capsys: pytest.CaptureFixture[s
     assert json.loads(capsys.readouterr().out)["queued"] is True
 
 
+def test_outbox_list_exits_zero(api: TestClient, capsys: pytest.CaptureFixture[str]) -> None:
+    """Список застрявших записей доступен и в машинном виде."""
+    assert _run_cli(["--json", "outbox"]) == client_module.EXIT_OK
+    assert isinstance(json.loads(capsys.readouterr().out), list)
+
+
+def test_outbox_rejects_state_that_needs_no_review(api: TestClient) -> None:
+    """Фильтр по состоянию, которое человек не разбирает, — ошибка аргументов.
+
+    Иначе `--state sent` молча выдал бы всю историю отправок под видом списка
+    застрявшего.
+    """
+    assert _run_cli(["--json", "outbox", "--state", "sent"]) == client_module.EXIT_USAGE
+
+
+def test_retry_of_missing_item_exits_not_found(api: TestClient) -> None:
+    assert _run_cli(["--json", "retry", "--id", "424242"]) == client_module.EXIT_NOT_FOUND
+
+
+def test_retry_of_live_item_exits_conflict(
+    api: TestClient, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Запись, которую ведёт демон, повторить нельзя — код конфликта."""
+    _run_cli(["--json", "accounts", "add", "--phone", "+79990000003"])
+    capsys.readouterr()
+
+    _run_cli(["--json", "login", "start", "--account-id", "1"])
+    challenge_id = json.loads(capsys.readouterr().out)["challenge_id"]
+    _run_cli(["--json", "login", "complete", "--challenge-id", challenge_id, "--code", STUB_CODE])
+    capsys.readouterr()
+
+    _run_cli(["--json", "send", "--account-id", "1", "--chat-id", "chat-cli", "--text", "живое"])
+    item_id = json.loads(capsys.readouterr().out)["item"]["id"]
+
+    assert _run_cli(["--json", "retry", "--id", str(item_id)]) == client_module.EXIT_CONFLICT
+
+
 def test_unreachable_daemon_exits_three(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("MAXUB_TOKEN", "irrelevant")

@@ -2,15 +2,35 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
+from maxub.core.models import OutboxState
 from maxub.core.service import UserbotService
 
 # Верхние границы отсекают запросы, способные раздуть БД или память демона.
 MAX_TEXT_LENGTH = 4000
 MAX_LABEL_LENGTH = 100
 MAX_PAGE_SIZE = 500
+
+# Разбор застрявших записей — работа глазами: страница по умолчанию короче
+# предельной, чтобы человек видел список целиком, а не его хвост.
+STUCK_PAGE_SIZE = 50
+
+
+class StuckState(StrEnum):
+    """Состояния, которые вообще имеет смысл разбирать вручную.
+
+    Отдельный тип, а не весь ``OutboxState``: запрос очереди на разбор с
+    фильтром ``sent`` вернул бы всю историю отправок и ничего не сказал бы о
+    застрявшем. Опечатка в состоянии отсекается на границе, а не отдаёт
+    молчаливо пустой список.
+    """
+
+    FAILED = OutboxState.FAILED.value
+    SENDING = OutboxState.SENDING.value
 
 
 class AddAccountRequest(BaseModel):

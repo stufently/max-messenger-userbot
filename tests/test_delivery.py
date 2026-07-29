@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 
@@ -10,9 +11,11 @@ import pytest
 from maxub.config import Settings
 from maxub.core.crypto import SecretBox, SecretError
 from maxub.core.models import OutboxState, Session
-from maxub.core.service import UserbotService
+from maxub.core.service import ServiceError, ServiceNotFound, UserbotService
 from maxub.core.storage import Storage
 from maxub.transport.base import (
+    ReconcileOutcome,
+    ReconcileResult,
     TransportNotApplied,
     TransportOutcomeUnknown,
     TransportRateLimited,
@@ -249,6 +252,196 @@ async def test_not_found_reconcile_delivers_exactly_once(settings: Settings) -> 
         assert [m.text for m in await shared.fetch_history("chat-3", 10)] == ["ровно раз"]
     finally:
         await service.stop()
+
+
+async def _left_to_human(service: UserbotService, chat_id: str, text: str) -> int:
+    """Доводит сообщение до отказа с неизвестным исходом и возвращает его id.
+
+    Ровно тот случай, ради которого существует ручной разбор: сообщение ушло в
+    сеть, сверка ничего не доказала, и решение осталось за человеком.
+    """
+    account_id = await login_by_phone(service)
+    transport = service._connections.get(account_id)
+    assert isinstance(transport, StubTransport)
+    transport.fail_sends = 1
+    transport.fail_with = TransportOutcomeUnknown("обрыв связи")
+    transport.reconcile_inconclusive = True
+
+    item, _ = await service.enqueue_message(account_id, chat_id, text)
+    await wait_for(_awaits_state(service, item.id, OutboxState.FAILED))
+    return item.id
+
+
+async def test_stuck_items_are_listed_with_reason(service: UserbotService) -> None:
+    """Список отказавших даёт всё, что нужно для решения по конкретной записи."""
+    item_id = await _left_to_human(service, "chat-review", "разобрать вручную")
+
+    listed = await service.list_stuck_messages(limit=50)
+    row = next(r for r in listed if r["id"] == item_id)
+    assert row["state"] == OutboxState.FAILED.value
+    assert row["chat_id"] == "chat-review"
+    assert "исход отправки неизвестен" in str(row["error"])
+    assert int(str(row["attempts"])) >= 1
+    assert row["created_at"]
+
+    # Отправленное человека не касается: в списке его быть не должно, иначе
+    # разбирать пришлось бы всю очередь целиком.
+    delivered, _ = await service.enqueue_message(1, "chat-review", "дошло само")
+    await wait_for(_awaits_state(service, delivered.id, OutboxState.SENT))
+    assert all(r["id"] != delivered.id for r in await service.list_stuck_messages(limit=50))
+
+
+async def test_manual_retry_delivers_failed_item_once(settings: Settings) -> None:
+    """Повтор отказавшей записи действительно уходит — и ровно один раз.
+
+    Лимит попыток исчерпан отказом, поэтому без сброса счётчика воркер закрыл бы
+    запись, не дойдя до транспорта, и повтор оказался бы бумажным.
+    """
+    settings.max_send_attempts = 1
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        # «Точно не выполнено»: на сервере следа не остаётся, и сверка потом
+        # честно отвечает «сообщения нет».
+        transport.fail_sends = 1
+        transport.fail_with = TransportNotApplied("канал занят")
+
+        item, _ = await service.enqueue_message(account_id, "chat-manual", "повторить вручную")
+        await wait_for(_awaits_state(service, item.id, OutboxState.FAILED))
+
+        result = await service.retry_message(item.id)
+        assert result["requeued"] is True
+        assert result["check"] == "not_found"
+        assert result["duplicate_risk"] is False
+
+        await wait_for(_awaits_state(service, item.id, OutboxState.SENT))
+        assert [m.text for m in await transport.fetch_history("chat-manual", 10)] == [
+            "повторить вручную"
+        ]
+    finally:
+        await service.stop()
+
+
+async def test_manual_retry_does_not_duplicate_delivered_message(service: UserbotService) -> None:
+    """Если сверка нашла сообщение на сервере, повтора не будет.
+
+    Человек просит доставку, а не второй сетевой вызов: доказанная доставка
+    закрывает запись, и получатель не видит дубль.
+    """
+    item_id = await _left_to_human(service, "chat-found", "дошло вслепую")
+    transport = service._connections.get(1)
+    assert isinstance(transport, StubTransport)
+    # Связь восстановилась, и теперь сервер может ответить о судьбе сообщения.
+    transport.reconcile_inconclusive = False
+
+    result = await service.retry_message(item_id)
+
+    assert result["requeued"] is False
+    assert result["check"] == "found"
+    assert result["duplicate_risk"] is False
+    stored = await service._storage.get_outbox(item_id)
+    assert stored is not None
+    assert stored.state is OutboxState.SENT
+    assert len(await transport.fetch_history("chat-found", 10)) == 1
+
+
+async def test_manual_retry_reports_duplicate_risk(service: UserbotService) -> None:
+    """Повтор без доказательств разрешён, но риск дубля назван прямо."""
+    item_id = await _left_to_human(service, "chat-risk", "под ответственность")
+
+    result = await service.retry_message(item_id)
+
+    assert result["requeued"] is True
+    assert result["check"] == "inconclusive"
+    assert result["duplicate_risk"] is True
+    assert "дубль" in str(result["detail"])
+
+
+async def test_manual_retry_refuses_live_item(settings: Settings) -> None:
+    """Запись, которой распоряжается воркер, у него не отбирают.
+
+    Долгая пауза перед повтором держит запись в очереди: она жива, просто ждёт
+    своего срока, и ручное вмешательство сюда не допускается.
+    """
+    settings.retry_base_seconds = 30.0
+    settings.retry_max_seconds = 30.0
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        transport.fail_sends = 100
+        transport.fail_with = TransportNotApplied("канал занят")
+
+        item, _ = await service.enqueue_message(account_id, "chat-live", "живая запись")
+
+        async def parked() -> bool:
+            stored = await service._storage.get_outbox(item.id)
+            return stored is not None and stored.next_attempt_at is not None
+
+        await wait_for(parked)
+
+        with pytest.raises(ServiceError) as excinfo:
+            await service.retry_message(item.id)
+        # Именно конфликт состояния, а не «не найдено»: код выхода у них разный.
+        assert not isinstance(excinfo.value, ServiceNotFound)
+
+        stored = await service._storage.get_outbox(item.id)
+        assert stored is not None
+        assert stored.state is OutboxState.QUEUED
+        assert stored.attempts == 1
+        assert stored.next_attempt_at is not None
+    finally:
+        await service.stop()
+
+
+async def test_concurrent_manual_retries_do_not_duplicate(service: UserbotService) -> None:
+    """Два одновременных повтора одной записи не отправляют её дважды.
+
+    Худший случай — когда первому запросу сверка отвечает «сообщение на
+    сервере», а второму (пока первый ещё ждёт ответа) выяснить не удаётся: без
+    порядка разбора второй вернул бы запись в очередь и получатель увидел бы
+    дубль.
+    """
+    item_id = await _left_to_human(service, "chat-race", "гонка разборов")
+    transport = service._connections.get(1)
+    assert isinstance(transport, StubTransport)
+    transport.reconcile_inconclusive = False
+    honest = transport.reconcile_send
+    calls = 0
+
+    async def slow_then_inconclusive(chat_id: str, client_token: str) -> ReconcileResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(0.2)
+            return await honest(chat_id, client_token)
+        return ReconcileResult(outcome=ReconcileOutcome.INCONCLUSIVE, detail="имитация гонки")
+
+    transport.reconcile_send = slow_then_inconclusive  # type: ignore[method-assign]
+
+    outcomes = await asyncio.gather(
+        service.retry_message(item_id),
+        service.retry_message(item_id),
+        return_exceptions=True,
+    )
+
+    decided = [o for o in outcomes if isinstance(o, dict)]
+    refused = [o for o in outcomes if isinstance(o, ServiceError)]
+    assert len(decided) == 1
+    assert len(refused) == 1
+    assert decided[0]["check"] == "found"
+    assert len(await transport.fetch_history("chat-race", 10)) == 1
+
+
+async def test_manual_retry_of_missing_item_is_not_found(service: UserbotService) -> None:
+    """Несуществующая запись — это «не найдено», а не отказ общего вида."""
+    with pytest.raises(ServiceNotFound):
+        await service.retry_message(424242)
 
 
 async def test_retry_is_scheduled_not_immediate(service: UserbotService) -> None:

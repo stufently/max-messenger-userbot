@@ -71,12 +71,25 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: packaging/constraints.txt
 
+      # Колесо и sdist отсюда уезжают в релиз, то есть это сборка дистрибутива,
+      # а не проверка: версии закреплены файлом ограничений. Тем же файлом
+      # закреплён и hatchling, который ставится в изолированное окружение
+      # сборки, — от его версии зависит содержимое колеса.
+      #
+      # Тот же `python -m build` в ci.yml намеренно идёт без ограничений: там он
+      # играет роль раннего предупреждения (подробности в шапке ci.yml).
       - name: Install build backend
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
+          PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
         run: python -m pip install --upgrade pip && python -m pip install build
 
       - name: Build wheel and sdist
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
+          PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
         run: python -m build
 
       - name: Upload distributions

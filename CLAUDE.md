@@ -41,6 +41,7 @@ src/maxub/
     supervisor.py    надзор за соединением и переподключение
     sender.py        очередь отправки и политика повторов
     reconcile.py     сверка отправок с неизвестным исходом
+    manual_retry.py  ручной разбор застрявших записей человеком
     ratelimit.py     token bucket, джиттер, штрафы
     events.py        раздача событий подписчикам
     service.py       состав операций, фасад над остальным
@@ -53,6 +54,7 @@ src/maxub/
   winlauncher.py     точка входа exe: демон плюс панель в браузере
   winhost.py         обвязка Windows: каталог данных, порт, журнал, мьютекс
 packaging/windows/   сборка автономного exe: образ с Wine, спека PyInstaller
+packaging/constraints.txt  точные версии для сборки дистрибутива
 .github/workflows/   CI: проверки, сборка под Windows, релиз по тегу
 tests/               тесты ядра, API, доставки, QR, миграций, веб-панели и CLI
 ```

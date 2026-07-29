@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import aiosqlite
 
 from maxub.core.models import OutboxItem, OutboxState, utcnow
@@ -105,6 +107,24 @@ class OutboxMixin(Database):
         async with self.db.execute("SELECT * FROM outbox WHERE id = ?", (item_id,)) as cursor:
             row = await cursor.fetchone()
         return outbox_row(row) if row else None
+
+    async def list_outbox(self, states: Sequence[OutboxState], limit: int) -> list[OutboxItem]:
+        """Записи очереди в указанных состояниях, свежие сверху.
+
+        Сводка в статусе отвечает на вопрос «сколько», а решение по застрявшему
+        сообщению принимается по самой записи: её ошибке, числу попыток и
+        времени. Без этого списка отказавшую запись нельзя даже назвать по
+        идентификатору, то есть и разобрать её вручную нечем.
+        """
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        async with self.db.execute(
+            f"SELECT * FROM outbox WHERE state IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+            (*(state.value for state in states), limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [outbox_row(row) for row in rows]
 
     async def outbox_stats(self) -> dict[str, int]:
         """Сводка по состояниям очереди.

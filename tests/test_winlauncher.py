@@ -1,19 +1,22 @@
 """Обвязка автономной сборки: замок каталога, адрес демона, гонка секретов.
 
-Тесты не требуют Windows: замок и разбор адреса написаны кроссплатформенно
-именно для того, чтобы их можно было проверить здесь, а не только руками на
-чужой машине. Специфичное для Windows (окно ошибки, буфер обмена, ACL) остаётся
-за пределами — там проверять нечего без самой системы.
+Тесты не требуют Windows: замок, разбор адреса и обращения к демону написаны
+кроссплатформенно именно для того, чтобы их можно было проверить здесь, а не
+только руками на чужой машине. Специфичное для Windows (окно ошибки, ACL)
+остаётся за пределами — там проверять нечего без самой системы.
 """
 
 from __future__ import annotations
 
+import json
 import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from maxub import winhost
+from maxub import winhost, winlauncher
 from maxub.config import Settings
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -99,6 +102,76 @@ def test_runtime_roundtrip(tmp_path: Path) -> None:
 def test_broken_runtime_is_not_an_instance(tmp_path: Path) -> None:
     (tmp_path / winhost.RUNTIME_FILE).write_text("не json", encoding="utf-8")
     assert winhost.running_instance(tmp_path, "/health") is None
+
+
+# --- одноразовый код входа ----------------------------------------------------
+
+DAEMON_TOKEN = "token-iz-fajla"
+HANDOFF_CODE = "odnorazovyj-kod"
+
+
+class _HandoffStub(BaseHTTPRequestHandler):
+    """Демон, отвечающий только на выдачу кода и только с верным токеном."""
+
+    def do_POST(self) -> None:  # noqa: N802 — имя задано BaseHTTPRequestHandler
+        if self.path != winlauncher.HANDOFF_PATH:
+            self.send_error(404)
+            return
+        if self.headers.get("Authorization") != f"Bearer {DAEMON_TOKEN}":
+            self.send_error(401)
+            return
+        body = json.dumps({"code": HANDOFF_CODE, "expires_in": 120}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Журнал сервера-заглушки в вывод тестов не нужен."""
+
+
+@pytest.fixture
+def handoff_server() -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HandoffStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_handoff_code_is_requested_with_token(handoff_server: str) -> None:
+    """Токен уходит в заголовке и дальше лаунчера не идёт; в браузер — код."""
+    code = winhost.request_handoff_code(handoff_server, winlauncher.HANDOFF_PATH, DAEMON_TOKEN)
+    assert code == HANDOFF_CODE
+
+
+def test_handoff_code_without_valid_token_is_none(handoff_server: str) -> None:
+    assert winhost.request_handoff_code(handoff_server, winlauncher.HANDOFF_PATH, "ne-tot") is None
+    # Недоступный демон — тоже отсутствие кода, а не исключение в потоке.
+    assert winhost.request_handoff_code("http://127.0.0.1:1", "/web/handoff", DAEMON_TOKEN) is None
+
+
+def test_panel_url_carries_one_time_code(handoff_server: str) -> None:
+    url = winlauncher.panel_url(handoff_server, DAEMON_TOKEN)
+    assert url == f"{handoff_server}{winlauncher.WEB_ENTER_PATH}?code={HANDOFF_CODE}"
+    # Токен в адрес не попадает ни при каких условиях: он бы осел в истории.
+    assert DAEMON_TOKEN not in url
+
+
+def test_panel_url_falls_back_to_token_form(handoff_server: str) -> None:
+    """Без кода панель всё равно открывается — вход по токену никуда не делся."""
+    url = winlauncher.panel_url(handoff_server, "ne-tot")
+    assert url == f"{handoff_server}{winlauncher.WEB_PAGE_PATH}"
+
+
+def test_clipboard_helper_is_gone() -> None:
+    """Токен больше не проходит через буфер обмена Windows."""
+    assert not hasattr(winhost, "copy_token_to_clipboard")
 
 
 # --- замок каталога данных ----------------------------------------------------

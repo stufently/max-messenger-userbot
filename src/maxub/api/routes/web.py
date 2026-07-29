@@ -3,7 +3,9 @@
 Страницу отдаёт тот же демон — отдельного сервера нет (этап 1 в docs/stack.md).
 Вход браузера и защита от CSRF вынесены в
 [web_session][maxub.api.routes.web_session]; там же объяснено, почему у веба
-собственная аутентификация вместо bearer-токена основного API.
+собственная аутентификация вместо bearer-токена основного API. Одноразовый код
+входа, которым пользуется автономная сборка под Windows, — в
+[web_handoff][maxub.api.routes.web_handoff].
 
 Операции продублированы под ``/web/api/*``, а не подключены к существующим
 ``/accounts`` и ``/login/*``: у тех маршрутов аутентификация зашита в сам
@@ -20,7 +22,7 @@ import qrcode
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
-from maxub.api.routes import web_session
+from maxub.api.routes import web_handoff, web_session
 from maxub.api.routes.common import (
     AccountRequest,
     AddAccountRequest,
@@ -57,6 +59,9 @@ router = APIRouter(
     dependencies=[Depends(require_local_host), Depends(secure_headers)],
 )
 router.include_router(web_session.router)
+# Одноразовый код входа: выдача закрыта bearer-токеном, обмен — открытый GET,
+# но без действующего кода он лишь возвращает на страницу входа.
+router.include_router(web_handoff.router)
 
 
 # --- страница и её файлы -----------------------------------------------------

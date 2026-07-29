@@ -6,9 +6,22 @@
 #
 # Почему trixie, а не bookworm. В bookworm Wine 8.0, в котором нет
 # KERNEL32.CopyFile2 — функции, которой пользуется Python 3.13: pip падает уже
-# на `ensurepip`. В trixie Wine 10.0, и та же связка работает. Оба тега явные,
-# `latest` не используется нигде.
-FROM debian:trixie-slim
+# на `ensurepip`. В trixie Wine 10.0, и та же связка работает.
+#
+# Закреплено по digest, а не по тегу: за `debian:trixie-slim` со временем встаёт
+# другой образ (в него въезжают обновления пакетов), и пересборка того же
+# коммита через полгода дала бы другой Wine — то есть другую среду, в которой
+# собирается exe. Digest снят с фактически скачанного образа
+# (`docker buildx imagetools inspect`) и указывает на манифест-список, поэтому
+# остаётся верным на любой архитектуре. Тег рядом — чтобы было видно, что
+# закреплено.
+#
+# Чего digest НЕ закрепляет: `apt-get install` ниже ходит в изменяемые
+# репозитории Debian, и версии Wine в них со временем меняются. Полная фиксация
+# потребовала бы snapshot.debian.org; пока это осознанно оставлено плавающим —
+# закреплён базовый слой и всё, что относится к Python.
+FROM debian@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+# debian:trixie-slim
 
 # Версия Python зафиксирована. Сумма — SHA-256, опубликованная python.org на
 # странице релиза, и проверенная на скачанном файле; при смене версии её нужно
@@ -17,9 +30,6 @@ FROM debian:trixie-slim
 ARG PYTHON_VERSION=3.13.14
 ARG PYTHON_SHA256=c54d9b9bbb8a36e6489363ddd01139707fd781d72f1f9e90c7ec65d0061368e0
 ARG PYTHON_DIR="C:\\Python313"
-# PyInstaller тоже закреплён: релизный exe должен собираться одинаково сегодня
-# и через полгода.
-ARG PYINSTALLER_VERSION=6.21.0
 
 # UID/GID того, кто собирает. Wine отказывается работать с префиксом, который
 # ему не принадлежит («'/opt/wine' is not owned by you»), — прав на запись мало,
@@ -90,12 +100,24 @@ RUN set -eux; \
 # Зависимости берутся из pyproject.toml, а не переписываются сюда руками:
 # второй список разошёлся бы с первым. Сам пакет `maxub` в образ не ставится —
 # исходники монтируются при сборке, и образ не устаревает от каждого коммита.
+#
+# Версии — из packaging/constraints.txt, оттуда же берётся и версия PyInstaller.
+# Раньше она стояла здесь отдельным ARG и вторым числом в
+# .github/workflows/windows-build.yml: два значения, обязанные совпадать, но
+# ничем не связанные, — правка одного молча оставляла второе. Теперь `pip` зовут
+# без номера версии, номер приходит из ограничений.
+#
+# Путь в переменной — в виде, понятном Windows-pip: он запущен под Wine, и
+# POSIX-путь /build он не откроет.
 COPY pyproject.toml /build/pyproject.toml
+COPY packaging/constraints.txt /build/constraints.txt
 COPY packaging/windows/requirements.py /build/requirements.py
 RUN set -eux; \
+    export PIP_CONSTRAINT='Z:\build\constraints.txt'; \
+    export PIP_BUILD_CONSTRAINT='Z:\build\constraints.txt'; \
     wine "$WINEPYTHON" 'Z:\build\requirements.py' 'Z:\build\pyproject.toml' 'Z:\build\requirements.txt'; \
     wine "$WINEPYTHON" -m pip install --no-cache-dir --no-input \
-        "pyinstaller==${PYINSTALLER_VERSION}" -r 'Z:\build\requirements.txt'; \
+        pyinstaller -r 'Z:\build\requirements.txt'; \
     wine "$WINEPYTHON" -m PyInstaller --version
 
 COPY --chmod=0755 packaging/windows/build-inside.sh /usr/local/bin/maxub-winbuild

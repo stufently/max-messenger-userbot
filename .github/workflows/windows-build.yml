@@ -17,6 +17,10 @@ on:
   pull_request:
     paths:
       - "packaging/windows/**"
+      # Версии для сборки exe приходят отсюда. Без этой строки правка пина
+      # проверялась бы только после слияния в main — то есть ошибку в закреплении
+      # ловил бы уже релиз.
+      - "packaging/constraints.txt"
       - "src/**"
       - "pyproject.toml"
       - ".github/workflows/windows-build.yml"
@@ -42,10 +46,19 @@ jobs:
           python-version: "3.13.14"
 
       - name: Install project and build tools
+        # Версии закреплены файлом ограничений: это релизный артефакт, и его
+        # состав не должен зависеть от того, что вышло на PyPI в день сборки.
+        # Номер версии PyInstaller здесь не пишется — он живёт в том же файле,
+        # что и версии для сборки под Wine, иначе два числа разъезжаются.
+        # `PIP_BUILD_CONSTRAINT` — чтобы ограничения дошли и до изолированного
+        # окружения, в котором собирается колесо проекта.
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
+          PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
         run: |
           python -m pip install --upgrade pip
           python -m pip install .
-          python -m pip install pyinstaller==6.21.0
+          python -m pip install pyinstaller
 
       - name: Build exe
         run: python -m PyInstaller --noconfirm --clean packaging/windows/maxub.spec

@@ -7,11 +7,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
-from maxub.core.models import Account, AccountState, Event, OutboxItem
+from maxub.core.models import Account, AccountState, Event, OutboxItem, OutboxState
 from maxub.transport.base import Transport
 
 TransportFactory = Callable[[], Transport]
@@ -59,6 +59,17 @@ class OutboxRepository(Protocol):
     ) -> bool: ...
 
     async def mark_failed(self, item_id: int, error: str) -> None: ...
+
+    # Ручной разбор: человек смотрит, что зависло, и решает по конкретной записи.
+    async def get_outbox(self, item_id: int) -> OutboxItem | None: ...
+
+    async def list_outbox(self, states: Sequence[OutboxState], limit: int) -> list[OutboxItem]: ...
+
+    async def requeue(self, item_id: int) -> bool: ...
+
+    async def mark_sent_after_review(
+        self, item_id: int, remote_message_id: str, event: Event
+    ) -> bool: ...
 
     async def save_penalty(self, account_id: int, action: str, until: datetime) -> None: ...
 

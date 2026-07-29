@@ -1,8 +1,8 @@
 """Обвязка Windows для автономной сборки.
 
 Всё, что зависит от особенностей системы, а не от логики запуска: каталог
-данных, свободный порт, журнал, окно с ошибкой, буфер обмена, защита от второго
-экземпляра и файл с адресом работающего демона.
+данных, свободный порт, журнал, окно с ошибкой, обращения к демону по HTTP,
+защита от второго экземпляра и файл с адресом работающего демона.
 
 Отделено от [winlauncher][maxub.winlauncher] намеренно: там читается сценарий
 «поднять демон и открыть панель», здесь — платформенные подробности, которые
@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import socket
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -98,36 +97,35 @@ def show_error(message: str) -> None:
         log.exception("не удалось показать окно с ошибкой")
 
 
-def copy_token_to_clipboard(token: str) -> bool:
-    """Кладёт токен в буфер обмена через `clip.exe`.
+def request_handoff_code(
+    base_url: str, handoff_path: str, token: str, timeout: float = 5.0
+) -> str | None:
+    """Просит у демона одноразовый код входа в панель.
 
-    Компромисс, а не идеал. Вход в панель — это ввод токена в форму, и
-    заставлять человека переписывать 43 случайных символа вручную нельзя. Плата
-    известна: буфер переживает вставку, попадает в историю буфера Windows и в
-    облачную синхронизацию, если та включена. Правильное решение — одноразовый
-    код входа в адресе панели; как только он появится в `api/routes/web.py`,
-    копирование в буфер убирается совсем.
+    Токен уходит в заголовке `Authorization` на петлевой адрес и дальше этого
+    процесса не идёт: в браузер попадает только код, который гаснет при первом
+    же переходе. Так лаунчер открывает панель сразу входом, не заставляя
+    человека переносить туда сам токен.
 
-    `CREATE_NO_WINDOW` нужен, чтобы у оконной сборки не мигало консольное окно.
+    `None` — код не выдан (панель выключена настройкой, демон отвечает иначе
+    или сеть подвела). Это не повод отказываться открывать панель: вход по
+    токену в форму остаётся рабочим, поэтому ошибка только пишется в журнал.
     """
-    if sys.platform != "win32":
-        return False
+    request = urllib.request.Request(
+        f"{base_url}{handoff_path}",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Length": "0"},
+    )
     try:
-        subprocess.run(
-            ["clip.exe"],
-            # Токен состоит из ASCII-символов, поэтому кодировка ввода для
-            # clip.exe роли не играет; потоки вывода закрыты, потому что у
-            # оконного процесса их нет и наследовать нечего.
-            input=token.encode("ascii"),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception:  # noqa: BLE001 — без буфера токен просто копируют руками
-        log.warning("не удалось положить токен в буфер обмена", exc_info=True)
-        return False
-    return True
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        code = payload["code"]
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
+        log.warning("демон не выдал одноразовый код входа", exc_info=True)
+        return None
+    # Ответ мог прийти не от нашего демона (порт занят чем-то другим), поэтому
+    # тип проверяется явно: подставлять в адрес что попало незачем.
+    return code if isinstance(code, str) and code else None
 
 
 def probe_health(base_url: str, health_path: str, timeout: float = 1.0) -> bool:

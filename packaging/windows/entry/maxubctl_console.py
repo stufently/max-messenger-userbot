@@ -16,11 +16,27 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from maxub.cli.main import ctl
 from maxub.winhost import default_data_dir, running_instance
 from maxub.winlauncher import HEALTH_PATH
+
+
+def _force_utf8_output() -> None:
+    """Переводит вывод в UTF-8, не давая ему упасть на непредставимом символе.
+
+    Весь текст программы русский, а консоль Windows по умолчанию работает в
+    однобайтовой кодировке (cp866). Часть символов — рамки таблиц, тире, кавычки
+    — в неё не переводится, и печать справки заканчивается `UnicodeEncodeError`
+    вместо вывода. `errors="replace"` тут уместнее аккуратности: увидеть текст с
+    испорченным символом лучше, чем не увидеть ничего.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def _apply_windows_defaults() -> None:
@@ -35,5 +51,6 @@ def _apply_windows_defaults() -> None:
 
 
 if __name__ == "__main__":
+    _force_utf8_output()
     _apply_windows_defaults()
     ctl()

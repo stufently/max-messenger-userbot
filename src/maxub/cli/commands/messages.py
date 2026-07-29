@@ -34,6 +34,55 @@ def send(
     )
 
 
+def outbox(
+    ctx: typer.Context,
+    state: Annotated[
+        str | None,
+        typer.Option(help="Только это состояние: failed или sending."),
+    ] = None,
+    limit: Annotated[int, typer.Option(help="Сколько записей вернуть.")] = 50,
+) -> None:
+    """Показать записи очереди, которые ждут решения человека.
+
+    Без `--state` это отказавшие и застрявшие «в полёте»: остальные движутся
+    сами. Идентификатор из первого столбца принимает команда `retry`.
+    """
+    params: dict[str, object] = {"limit": limit}
+    if state:
+        params["state"] = state
+    data = client_of(ctx).get("/outbox", params=params)
+    table = Table("id", "аккаунт", "чат", "состояние", "попыток", "создано", "ошибка")
+    for item in data:
+        table.add_row(
+            str(item["id"]),
+            str(item["account_id"]),
+            item["chat_id"],
+            item["state"],
+            str(item["attempts"]),
+            str(item["created_at"]),
+            item.get("error") or "",
+        )
+    emit(ctx, data, table)
+
+
+def retry(
+    ctx: typer.Context,
+    item_id: Annotated[int, typer.Option("--id", help="Идентификатор записи очереди.")],
+) -> None:
+    """Повторить отправку отказавшей записи.
+
+    ОСТОРОЖНО: сообщение могло дойти до получателя, и тогда повтор создаст у
+    него дубль. Перед повтором демон сверяется с сервером, если транспорт это
+    умеет; когда сверить не удалось, ответ помечен `duplicate_risk: true` — риск
+    берёт на себя тот, кто выполняет команду.
+
+    Повторить можно любую запись в состоянии failed — и с неизвестным исходом, и
+    с исчерпанными попытками, и отвергнутую после потери авторизации. Живую
+    запись у демона забирать нельзя: такой вызов завершается кодом 5.
+    """
+    emit(ctx, client_of(ctx).post(f"/outbox/{item_id}/retry"))
+
+
 def history(
     ctx: typer.Context,
     account_id: Annotated[int, ACCOUNT_OPTION],

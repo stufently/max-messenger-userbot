@@ -16,7 +16,16 @@ import logging
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
 from maxub.core.events import EventBus
-from maxub.core.models import Account, AccountState, Event, OutboxItem, QrStatus, Session
+from maxub.core.manual_retry import ManualRetry, OutboxItemBusy, OutboxItemNotFound
+from maxub.core.models import (
+    Account,
+    AccountState,
+    Event,
+    OutboxItem,
+    OutboxState,
+    QrStatus,
+    Session,
+)
 from maxub.core.ports import TransportFactory
 from maxub.core.ratelimit import RateLimiter
 from maxub.core.sender import SEND_ACTION, OutboxWorker
@@ -27,6 +36,12 @@ from maxub.transport.base import Capabilities, TransportAuthError, TransportUnsu
 log = logging.getLogger(__name__)
 
 DEDUP_WINDOW_SECONDS = 60.0
+
+# Состояния, из которых сообщение само уже не выберется: отказавшие записи ждут
+# решения человека, «в полёте» — разбора при следующем запуске демона. Остальные
+# движутся сами, и показывать их как «застрявшее» значило бы звать человека туда,
+# где он не нужен.
+STUCK_STATES = (OutboxState.FAILED, OutboxState.SENDING)
 
 # Состояния, из которых аккаунт поднимается сам при старте демона. DISABLED
 # сюда не входит: остановку вручную процесс отменять не должен.
@@ -49,6 +64,14 @@ class ServiceOverloaded(ServiceError):
 
     Отделено от общей ошибки ради адаптеров: перегрузка и «не найдено» должны
     выглядеть по-разному и для HTTP, и для человека за CLI.
+    """
+
+
+class ServiceNotFound(ServiceError):
+    """Объекта с таким идентификатором нет.
+
+    Отделено от конфликта состояния по той же причине: скрипт различает «такой
+    записи нет» и «эта запись сейчас недоступна» по коду выхода, а не по тексту.
     """
 
 
@@ -87,6 +110,7 @@ class UserbotService:
             publish=self._events.publish,
             on_auth_lost=self._on_auth_lost,
         )
+        self._manual_retry = ManualRetry(storage, self._connections.get, self._events.publish)
         self._login = LoginService(storage, self._connections)
         self._worker_task: asyncio.Task[None] | None = None
 
@@ -224,6 +248,34 @@ class UserbotService:
         # отправить тот же текст стало бы невозможно навсегда.
         window = float("inf") if nonce else DEDUP_WINDOW_SECONDS
         return await self._storage.enqueue(account_id, chat_id, text, key, window)
+
+    async def list_stuck_messages(
+        self, limit: int, state: OutboxState | None = None
+    ) -> list[dict[str, object]]:
+        """Записи, которые сами не уедут: отказавшие и застрявшие «в полёте».
+
+        Отдаются целиком, вместе с ошибкой и числом попыток: человек решает по
+        содержимому записи, а не по её идентификатору.
+        """
+        states = (state,) if state is not None else STUCK_STATES
+        items = await self._storage.list_outbox(states, limit)
+        return [item.model_dump(mode="json") for item in items]
+
+    async def retry_message(self, item_id: int) -> dict[str, object]:
+        """Повторяет отправку отказавшей записи по решению человека.
+
+        Сообщение могло дойти до получателя — тогда повтор создаст дубль.
+        Поэтому перед повтором демон сверяется с сервером, если транспорт это
+        умеет, а исход сверки возвращается вызывающему вместе с признаком
+        ``duplicate_risk``.
+        """
+        try:
+            result = await self._manual_retry.retry(item_id)
+        except OutboxItemNotFound as exc:
+            raise ServiceNotFound(str(exc)) from exc
+        except OutboxItemBusy as exc:
+            raise ServiceError(str(exc)) from exc
+        return result.model_dump(mode="json")
 
     async def fetch_history(
         self, account_id: int, chat_id: str, limit: int
