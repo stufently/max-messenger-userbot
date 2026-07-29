@@ -159,6 +159,62 @@ jobs:
             max-userbot:ci \
             python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); print(t.name, t.capabilities.send_text)"
 
+  winbuild-base:
+    name: Сборочный образ Windows согласован
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Base image digest matches the Debian snapshot
+        # В packaging/windows/Dockerfile два входа, обязанных соответствовать
+        # друг другу: digest базового образа и дата снимка snapshot.debian.org,
+        # из которого ставится Wine. Сам Dockerfile это и проверяет — но при
+        # сборке, а её здесь нет: релизный exe собирается нативно на
+        # windows-latest, и образ под Wine в CI не строится вовсе. То есть
+        # обновление одного digest-а (а Dependabot двигает именно его и только
+        # его) прошло бы все проверки зелёным и сломало бы локальную сборку у
+        # того, кто следующим её запустит.
+        #
+        # Образ не запускается: файл достаётся `docker cp` из созданного, но не
+        # стартовавшего контейнера. Проверке нужно только содержимое, а команда
+        # внутри чужого образа — лишнее доверие на ровном месте.
+        run: |
+          set -euo pipefail
+          dockerfile=packaging/windows/Dockerfile
+          mapfile -t images < <(sed -n 's/^FROM \(debian@sha256:[0-9a-f]\{64\}\)$/\1/p' "$dockerfile")
+          # Дата снимка разбирается по форме, а не «всё после знака равенства»:
+          # иначе пустое или битое значение прошло бы дальше и попало в шаблон
+          # поиска, где часть символов значит не себя.
+          mapfile -t snapshots < <(sed -n 's/^ARG DEBIAN_SNAPSHOT=\([0-9]\{8\}T[0-9]\{6\}Z\)$/\1/p' "$dockerfile")
+          # Ноль совпадений означал бы, что проверка молча перестала проверять,
+          # а несколько — что она сверяет не то, что попадёт в сборку.
+          if [ "${#images[@]}" -ne 1 ] || [ "${#snapshots[@]}" -ne 1 ]; then
+            echo "в $dockerfile ожидались ровно один FROM debian@sha256: и один ARG DEBIAN_SNAPSHOT," >&2
+            echo "найдено: образов ${#images[@]}, снимков ${#snapshots[@]}" >&2
+            exit 1
+          fi
+          image="${images[0]}"
+          snapshot="${snapshots[0]}"
+          echo "образ $image, снимок $snapshot"
+          container="$(docker create "$image")"
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          # Во временный каталог, а не в рабочую копию: проверка не должна
+          # оставлять за собой файлов в дереве репозитория.
+          sources="${RUNNER_TEMP:-/tmp}/debian.sources"
+          docker cp "$container:/etc/apt/sources.list.d/debian.sources" "$sources"
+          # Обе записи, как и в самом Dockerfile: security-снимок живёт отдельной
+          # строкой и разъезжается независимо.
+          for archive in debian debian-security; do
+            if ! grep -Fq -- "archive/$archive/$snapshot" "$sources"; then
+              echo "ARG DEBIAN_SNAPSHOT=$snapshot расходится с базовым образом;" >&2
+              echo "в образе записано:" >&2
+              grep -F snapshot.debian.org "$sources" >&2
+              exit 1
+            fi
+          done
+          echo "digest и снимок согласованы"
+
   package:
     name: Колесо и статика веб-панели
     runs-on: ubuntu-latest
