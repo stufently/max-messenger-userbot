@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>MAX Userbot — аккаунты</title>
+  <link rel="stylesheet" href="/web/static/app.css">
+</head>
+<body>
+<header class="bar">
+  <h1>MAX Userbot</h1>
+  <span id="summary" class="summary"></span>
+  <button id="logout" type="button" class="ghost" hidden>Выйти</button>
+</header>
+
+<main>
+  <p id="message" class="message" hidden></p>
+
+  <section id="gate">
+    <h2>Вход в панель</h2>
+    <form id="token-form" autocomplete="off">
+      <label for="token">Токен демона</label>
+      <input id="token" name="token" type="password" required autocomplete="off" spellcheck="false">
+      <button type="submit">Войти</button>
+    </form>
+    <p class="hint">
+      Тот же токен, что использует <code>maxub</code>: файл <code>api_token</code>
+      в каталоге данных демона. Он отправляется один раз и в браузере не
+      сохраняется — вместо него выдаётся сессия в cookie.
+    </p>
+  </section>
+
+  <section id="workspace" hidden>
+    <h2>Аккаунты</h2>
+    <table class="accounts">
+      <thead>
+        <tr><th>№</th><th>Телефон</th><th>Метка</th><th>Состояние</th><th>Последняя ошибка</th><th></th></tr>
+      </thead>
+      <tbody id="accounts"></tbody>
+    </table>
+    <p id="empty" class="hint" hidden>Аккаунтов пока нет — добавьте первый.</p>
+
+    <section id="panel" class="panel" hidden>
+      <h3 id="panel-title"></h3>
+      <p id="panel-note" class="hint"></p>
+      <img id="panel-qr" alt="QR-код для входа" hidden>
+      <form id="code-form" hidden autocomplete="off">
+        <label for="code">Код из сообщения</label>
+        <input id="code" name="code" inputmode="numeric" required autocomplete="one-time-code">
+        <button type="submit">Подтвердить</button>
+      </form>
+      <button id="panel-close" type="button" class="ghost">Закрыть</button>
+    </section>
+
+    <h2>Добавить аккаунт</h2>
+    <form id="add-form" autocomplete="off">
+      <label for="phone">Телефон</label>
+      <input id="phone" name="phone" type="tel" required placeholder="+79990000000">
+      <label for="label">Метка (необязательно)</label>
+      <input id="label" name="label" type="text" maxlength="100" placeholder="личный">
+      <button type="submit">Добавить</button>
+    </form>
+  </section>
+</main>
+
+<!-- Обычные скрипты, а не модули: файл открывается с того же демона, порядок
+     важен только для session.js — он последний, потому что стартует панель. -->
+<script src="/web/static/api.js"></script>
+<script src="/web/static/accounts.js"></script>
+<script src="/web/static/login.js"></script>
+<script src="/web/static/session.js"></script>
+</body>
+</html>

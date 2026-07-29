@@ -8,7 +8,9 @@ license = { text = "MIT" }
 
 dependencies = [
     "aiosqlite>=0.20",
+    "cryptography>=43",
     "fastapi>=0.115",
+    "qrcode>=8",
     "httpx>=0.28",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -45,7 +47,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.per-file-ignores]
 # Depends() в значениях по умолчанию — штатная идиома FastAPI, не ошибка.
-"src/maxub/api/routes.py" = ["B008"]
+"src/maxub/api/routes/*.py" = ["B008"]
 # В тестах блокирующие проверки файлов и собственные ожидания допустимы.
 "tests/*" = ["ASYNC109", "ASYNC240"]
 
@@ -53,6 +55,11 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.11"
 strict = true
 packages = ["maxub"]
+
+[[tool.mypy.overrides]]
+# У qrcode нет типовых заглушек; используется одна функция отрисовки.
+module = ["qrcode.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

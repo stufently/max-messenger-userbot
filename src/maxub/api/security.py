@@ -23,5 +23,8 @@ async def require_token(
         )
     scheme, _, value = authorization.partition(" ")
     provided = value if scheme.lower() == "bearer" else authorization
-    if not secrets.compare_digest(provided.strip(), expected):
+    # Сравниваются байты, а не строки: `compare_digest` на строках с не-ASCII
+    # символами бросает TypeError, и подобранный заголовок валил бы запрос в
+    # 500 вместо честного отказа.
+    if not secrets.compare_digest(provided.strip().encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="неверный токен")

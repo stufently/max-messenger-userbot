@@ -9,8 +9,24 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from maxub.core.crypto import generate_key
+
 TOKEN_FILE = "api_token"
+KEY_FILE = "secret.key"
 DB_FILE = "maxub.db"
+
+
+def _write_secret_file(path: Path, content: str) -> None:
+    """Создаёт файл сразу с правами 0600.
+
+    Вариант «записать, потом chmod» оставляет окно, в котором файл доступен по
+    umask, — для секретов это неприемлемо.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, content.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 class Settings(BaseSettings):
@@ -26,8 +42,31 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1")
     port: int = Field(default=8765)
     token: str | None = Field(default=None)
+    secret_key: str | None = Field(default=None)
     transport: str = Field(default="stub")
     log_level: str = Field(default="info")
+
+    # Веб-панель управления аккаунтами. Включена по умолчанию: без неё аккаунт
+    # добавляется только из CLI. Выключается тем, кому лишняя поверхность в
+    # браузере не нужна — тогда маршрутов `/web/*` в приложении просто нет.
+    web_ui: bool = Field(default=True)
+
+    # Дополнительные имена, по которым разрешено открывать панель, через запятую.
+    # Нужны, когда демон слушает 0.0.0.0 (штатно для проброса порта из Docker):
+    # адрес привязки не говорит ничего о том, какому имени можно доверять, а
+    # принимать любой заголовок Host — значит пустить чужой сайт, отрезолвленный
+    # в 127.0.0.1, в один origin с панелью.
+    web_allowed_hosts: str = Field(default="")
+
+    # Повторы отправки. Задержка удваивается с каждой попыткой и переживает
+    # перезапуск демона — иначе после рестарта всё ломится на сервер разом.
+    retry_base_seconds: float = Field(default=5.0)
+    retry_max_seconds: float = Field(default=600.0)
+    max_send_attempts: int = Field(default=5)
+
+    # Переподключение аккаунта после обрыва.
+    reconnect_base_seconds: float = Field(default=3.0)
+    reconnect_max_seconds: float = Field(default=300.0)
 
     # Лимиты. Значения консервативные, но это не «гарантированно безопасные»
     # пороги — таких для закрытого API не существует, см. docs/stack.md.
@@ -42,6 +81,10 @@ class Settings(BaseSettings):
     @property
     def token_path(self) -> Path:
         return self.data_dir / TOKEN_FILE
+
+    @property
+    def secret_key_path(self) -> Path:
+        return self.data_dir / KEY_FILE
 
     def ensure_data_dir(self) -> None:
         """Создаёт каталог данных с правами 0700.
@@ -67,14 +110,26 @@ class Settings(BaseSettings):
             if existing:
                 return existing
         token = secrets.token_urlsafe(32)
-        # Файл создаётся сразу с правами 0600: вариант «записать, потом chmod»
-        # оставляет окно, в котором файл доступен по umask.
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            os.write(fd, token.encode("utf-8"))
-        finally:
-            os.close(fd)
+        _write_secret_file(path, token)
         return token
+
+    def resolve_secret_key(self) -> str:
+        """Возвращает ключ шифрования сессий, создавая его при первом запуске.
+
+        Приоритет у переменной окружения: она позволяет держать ключ вне тома с
+        базой — например, в секретах оркестратора.
+        """
+        if self.secret_key:
+            return self.secret_key
+        self.ensure_data_dir()
+        path = self.secret_key_path
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        key = generate_key()
+        _write_secret_file(path, key)
+        return key
 
 
 class ClientSettings(BaseSettings):

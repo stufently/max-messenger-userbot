@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from maxub.config import Settings
+from maxub.core.crypto import SecretBox
 from maxub.core.models import AccountState, OutboxState
 from maxub.core.service import ServiceError, UserbotService
 from maxub.core.storage import Storage
@@ -27,7 +28,9 @@ def settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 async def service(settings: Settings):
-    svc = UserbotService(settings, Storage(settings.db_path), StubTransport)
+    svc = UserbotService(
+        settings, Storage(settings.db_path, SecretBox(settings.resolve_secret_key())), StubTransport
+    )
     await svc.start()
     try:
         yield svc

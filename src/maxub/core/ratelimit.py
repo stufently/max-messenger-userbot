@@ -14,6 +14,9 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from maxub.core.models import utcnow
 
 
 @dataclass
@@ -56,7 +59,7 @@ class RateLimiter:
         self._burst = burst
         self._jitter = jitter_seconds
         self._buckets: dict[tuple[int, str], TokenBucket] = {}
-        self._penalty: dict[tuple[int, str], float] = {}
+        self._penalty: dict[tuple[int, str], datetime] = {}
 
     def _bucket(self, account_id: int, action: str) -> TokenBucket:
         key = (account_id, action)
@@ -66,17 +69,28 @@ class RateLimiter:
             self._buckets[key] = bucket
         return bucket
 
-    def penalize(self, account_id: int, action: str, retry_after: float) -> None:
-        """Учитывает ``retry_after`` от сервера — он всегда важнее нашего лимита."""
-        loop_now = asyncio.get_running_loop().time()
+    def penalize(self, account_id: int, action: str, retry_after: float) -> datetime:
+        """Учитывает ``retry_after`` от сервера — он всегда важнее нашего лимита.
+
+        Момент возврата хранится по стенным часам, а не по времени цикла: его
+        нужно сохранять в БД, чтобы штраф пережил перезапуск демона.
+        """
         key = (account_id, action)
-        self._penalty[key] = max(self._penalty.get(key, 0.0), loop_now + retry_after)
+        until = utcnow() + timedelta(seconds=retry_after)
+        current = self._penalty.get(key)
+        self._penalty[key] = max(current, until) if current else until
+        return self._penalty[key]
+
+    def restore(self, account_id: int, action: str, until: datetime) -> None:
+        """Возвращает штраф, сохранённый до перезапуска."""
+        if until > utcnow():
+            self._penalty[(account_id, action)] = until
 
     async def acquire(self, account_id: int, action: str) -> None:
         key = (account_id, action)
         penalty_until = self._penalty.get(key)
         if penalty_until is not None:
-            remaining = penalty_until - asyncio.get_running_loop().time()
+            remaining = (penalty_until - utcnow()).total_seconds()
             if remaining > 0:
                 await asyncio.sleep(remaining)
             self._penalty.pop(key, None)

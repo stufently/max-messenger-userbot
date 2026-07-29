@@ -30,7 +30,18 @@ class AccountState(StrEnum):
 
 
 class OutboxState(StrEnum):
+    """Состояния записи в очереди отправки.
+
+    CLAIMED и SENDING разделены намеренно. CLAIMED — «воркер забрал запись
+    себе, но транспорт её ещё не видел», SENDING — «сетевой вызов начат, исход
+    может быть любым». Если бы состояние было одно, после падения процесса вся
+    захваченная пачка выглядела бы неоднозначной, хотя дальше первой записи
+    дело не дошло: остальные пришлось бы отдавать человеку вместо простого
+    повтора.
+    """
+
     QUEUED = "queued"
+    CLAIMED = "claimed"
     SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
@@ -58,6 +69,7 @@ class OutboxItem(BaseModel):
     error: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     claimed_at: datetime | None = None
+    next_attempt_at: datetime | None = None
     sent_at: datetime | None = None
 
 
@@ -83,8 +95,28 @@ class Event(BaseModel):
 
 
 class LoginChallenge(BaseModel):
+    """Запрос кода подтверждения при входе по телефону."""
+
     challenge_id: str
     phone: str
+    expires_at: datetime
+
+
+class QrStatus(StrEnum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    EXPIRED = "expired"
+
+
+class QrChallenge(BaseModel):
+    """Запрос входа по QR-коду.
+
+    ``payload`` — это содержимое, которое кодируется в QR и сканируется
+    приложением MAX на телефоне. Номер телефона при таком входе не нужен.
+    """
+
+    challenge_id: str
+    payload: str
     expires_at: datetime
 
 

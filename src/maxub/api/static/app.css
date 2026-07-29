@@ -1,0 +1,112 @@
+/* Оформление панели. Ничего внешнего: ни шрифтов, ни CDN — страница должна
+   открываться на машине без интернета. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1c1c1e;
+  --muted: #6b7280;
+  --line: #d8dae0;
+  --accent: #2563eb;
+  --bad: #b91c1c;
+  --good: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --fg: #e8eaed;
+    --muted: #9aa1ad;
+    --line: #333842;
+    --accent: #6ea8fe;
+    --bad: #f87171;
+    --good: #4ade80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 system-ui, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bar h1 { font-size: 17px; margin: 0; }
+.summary { color: var(--muted); font-size: 13px; margin-right: auto; }
+
+main { max-width: 900px; margin: 0 auto; padding: 20px; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+h3 { font-size: 15px; margin: 0 0 8px; }
+
+form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+label { color: var(--muted); font-size: 13px; }
+
+input {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+
+button {
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--fg);
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+
+table.accounts { width: 100%; border-collapse: collapse; font-size: 14px; }
+.accounts th, .accounts td { padding: 8px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+.accounts th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.accounts td.actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.accounts td.error { color: var(--bad); font-size: 13px; }
+
+.state { font-size: 13px; }
+.state-ready { color: var(--good); }
+.state-backoff, .state-auth_required { color: var(--bad); }
+.state-disabled, .state-new { color: var(--muted); }
+
+.panel {
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.panel img { display: block; width: 240px; max-width: 100%; margin: 10px 0; image-rendering: pixelated; }
+
+.hint { color: var(--muted); font-size: 13px; }
+.hint code { font-size: 12px; }
+
+.message {
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.message.error { border-color: var(--bad); color: var(--bad); }
+.message.ok { border-color: var(--good); color: var(--good); }
