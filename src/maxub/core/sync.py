@@ -20,7 +20,7 @@ from maxub.config import Settings
 from maxub.core.backfill import Backfiller
 from maxub.core.events import account_state_event
 from maxub.core.models import AccountState, Event, Session
-from maxub.core.ports import AccountRepository, EventSink, TransportFactory
+from maxub.core.ports import AccountRepository, EventPublisher, EventSink, TransportFactory
 from maxub.core.stream import open_stream
 from maxub.core.supervisor import ConnectionSupervisor, SupervisorRegistry
 from maxub.transport.base import Transport, TransportAuthError
@@ -37,11 +37,16 @@ class ConnectionManager:
         factory: TransportFactory,
         settings: Settings,
         emit: EventSink,
+        publish: EventPublisher,
     ) -> None:
         self._repo = repo
         self._factory = factory
         self._settings = settings
         self._emit = emit
+        # Раздача без записи: событие о смене состояния уже попало в журнал той
+        # же транзакцией, что и само состояние, и записывать его второй раз
+        # значит спорить с уникальным индексом на ровном месте.
+        self._publish = publish
         self._backfill = Backfiller(repo, emit)
         self._transports: dict[int, Transport] = {}
         # Последняя известная сессия аккаунта. Держится отдельно от той, что
@@ -84,21 +89,23 @@ class ConnectionManager:
         await self._supervisors.stop(account_id)
         transport = self.ensure(account_id)
         await self._set_state(account_id, AccountState.CONNECTING)
+        # Разбор неудачи целиком здесь, и это не мелочь оформления. Раньше часть
+        # ошибок классифицировал вызывающий, и на старте демона аккаунт получал
+        # `BACKOFF` дважды: сначала отсюда, потом от того, кто поймал исключение.
+        # В журнале это два события об одном переходе.
         try:
             session = await self._remember(account_id, session, await transport.connect(session))
-        except TransportAuthError as exc:
-            await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
-            raise
-        try:
+            # Отказ может прийти и после `connect()` — например, подписка живого
+            # потока упрётся в отозванную сессию.
             pump = await self._open_stream(account_id, transport)
         except TransportAuthError as exc:
-            # Отказ может прийти и после `connect()` — например, подписка живого
-            # потока упрётся в отозванную сессию. `BACKOFF` тут обещал бы, что
-            # повтор поможет, а помогает только новый вход.
+            # `BACKOFF` тут обещал бы, что повтор поможет, а помогает только
+            # новый вход.
             await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
             raise
         except Exception as exc:
-            # Иначе аккаунт остался бы в syncing, хотя синхронизация встала.
+            # Иначе аккаунт остался бы в connecting или syncing, хотя ни то, ни
+            # другое уже не происходит.
             await self._set_state(account_id, AccountState.BACKOFF, str(exc))
             raise
         self._start_supervisor(account_id, session, pump)
@@ -149,7 +156,7 @@ class ConnectionManager:
             account_id,
             ConnectionSupervisor(
                 account_id,
-                self._repo,
+                partial(self._set_state, account_id),
                 self._settings,
                 partial(self._reconnect, account_id, session),
             ),
@@ -187,10 +194,12 @@ class ConnectionManager:
         осталась бы без события при первой же правке, и подписчик узнавал бы о
         потере авторизации только опросом статуса.
         """
-        await self._repo.set_account_state(account_id, state, error)
         event = account_state_event(account_id, state, error)
-        if event is not None:
-            await self._emit(event)
+        if event is None:
+            await self._repo.set_account_state(account_id, state, error)
+            return
+        if await self._repo.set_account_state_with_event(account_id, state, error, event):
+            self._publish(event)
 
     async def _remember(
         self, account_id: int, current: Session, refreshed: Session | None

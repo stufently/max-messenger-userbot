@@ -721,3 +721,26 @@ async def test_rotated_token_on_first_login_is_persisted(settings: Settings) -> 
         assert active.token == str(stored["token"])
     finally:
         await service.stop()
+
+
+async def test_supervisor_reports_backoff_to_subscribers(settings: Settings) -> None:
+    """Обрыв связи виден в живом потоке, а не только в опросе статуса.
+
+    Обрывы и потеря авторизации случаются именно здесь, под надзором. Пока надзор
+    писал состояние мимо общего пути, подписчик о них не узнавал вовсе — то есть
+    молчал ровно о том, ради чего поток и слушают.
+    """
+    transport = EndingStreamStub()
+    service = _service_over(settings, transport)
+    await service.start()
+    try:
+        await _login(service)
+        transport.close_first.set()
+
+        async def announced() -> bool:
+            events = await service.recent_events(limit=100, after_id=0)
+            return any(event["kind"] == "account.backoff" for event in events)
+
+        await _wait(announced)
+    finally:
+        await service.stop()

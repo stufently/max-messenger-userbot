@@ -191,3 +191,49 @@ def test_auth_loss_reaches_the_journal(app_client: TestClient) -> None:
 
     kinds = [event["kind"] for event in app_client.get("/events").json()]
     assert "account.disabled" in kinds
+
+
+def test_state_and_event_are_written_together(app_client: TestClient) -> None:
+    """Смена состояния и событие о ней — одна транзакция, а не две подряд.
+
+    Двумя записями это было бы «состояние сменилось, а никто не узнал»: между
+    ними процесс может умереть, а задачу — отменить.
+    """
+    account_id = app_client.post("/accounts", json={"phone": "+79990000104"}).json()["id"]
+
+    app_client.post(f"/accounts/{account_id}/disable", json={"reason": "проверка"})
+
+    state = next(a["state"] for a in app_client.get("/accounts").json() if a["id"] == account_id)
+    kinds = [event["kind"] for event in app_client.get("/events").json()]
+    assert state == "disabled"
+    assert kinds.count("account.disabled") == 1
+
+
+def test_repeated_state_is_not_announced(app_client: TestClient) -> None:
+    """Запись того же состояния — это не переход, и события о нём быть не должно.
+
+    Запрос кода ставит аккаунту `auth_required`, а он в нём чаще всего и
+    находится. Событие об этом означало бы переход, которого не было.
+    """
+    account_id = app_client.post("/accounts", json={"phone": "+79990000105"}).json()["id"]
+
+    app_client.post("/login/start", json={"account_id": account_id})
+    app_client.post("/login/start", json={"account_id": account_id})
+
+    kinds = [event["kind"] for event in app_client.get("/events").json()]
+    assert "account.auth_required" not in kinds
+
+
+def test_failed_login_is_announced(app_client: TestClient) -> None:
+    """А вот сорвавшийся вход у готового аккаунта — переход, и он виден."""
+    account_id = app_client.post("/accounts", json={"phone": "+79990000106"}).json()["id"]
+    challenge_id = app_client.post("/login/start", json={"account_id": account_id}).json()[
+        "challenge_id"
+    ]
+    app_client.post("/login/complete", json={"challenge_id": challenge_id, "code": STUB_CODE})
+
+    second = app_client.post("/login/start", json={"account_id": account_id}).json()
+    app_client.post("/login/complete", json={"challenge_id": second["challenge_id"], "code": "нет"})
+
+    kinds = [event["kind"] for event in app_client.get("/events").json()]
+    assert "account.auth_required" in kinds

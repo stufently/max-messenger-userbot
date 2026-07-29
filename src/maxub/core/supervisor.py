@@ -15,7 +15,6 @@ from functools import partial
 
 from maxub.config import Settings
 from maxub.core.models import AccountState
-from maxub.core.ports import AccountRepository
 from maxub.core.sender import backoff_delay
 from maxub.transport.base import TransportAuthError, TransportError
 
@@ -40,6 +39,12 @@ STABLE_CONNECTION_SECONDS = 30.0
 #: Поднимает соединение заново и возвращает задачу живого потока.
 Reopen = Callable[[], Awaitable["asyncio.Task[None]"]]
 
+#: Записывает состояние аккаунта и рассказывает о нём подписчикам. Надзор берёт
+#: именно её, а не хранилище: обрывы и потеря авторизации случаются здесь, и
+#: писать состояние мимо общего пути значило бы, что живой поток о них молчит —
+#: ровно о том, ради чего его и слушают.
+StateWriter = Callable[[AccountState, str | None], Awaitable[None]]
+
 
 class ConnectionSupervisor:
     """Держит аккаунт подключённым, пока надзор не отменят."""
@@ -47,12 +52,12 @@ class ConnectionSupervisor:
     def __init__(
         self,
         account_id: int,
-        repo: AccountRepository,
+        set_state: StateWriter,
         settings: Settings,
         reopen: Reopen,
     ) -> None:
         self._account_id = account_id
-        self._repo = repo
+        self._write_state = set_state
         self._settings = settings
         self._reopen = reopen
 
@@ -134,7 +139,7 @@ class ConnectionSupervisor:
         await asyncio.sleep(delay.total_seconds())
 
     async def _set_state(self, state: AccountState, exc: Exception) -> None:
-        await self._repo.set_account_state(self._account_id, state, str(exc))
+        await self._write_state(state, str(exc))
 
     async def _auth_lost(self, exc: Exception) -> None:
         """Сессия отозвана: повторять бессмысленно, нужен новый вход."""

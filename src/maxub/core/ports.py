@@ -17,6 +17,12 @@ from maxub.transport.base import Transport
 TransportFactory = Callable[[], Transport]
 EventSink = Callable[[Event], Awaitable[None]]
 
+#: Записывает состояние аккаунта и рассказывает о нём подписчикам. Берётся
+#: вместо прямого обращения к хранилищу везде, где состояние меняется по ходу
+#: работы: событие и запись обязаны уходить вместе, а пара вызовов на каждом
+#: переходе рано или поздно расходится.
+AccountStateWriter = Callable[[int, AccountState, str | None], Awaitable[None]]
+
 #: Раздача уже записанного события подписчикам. Отдельно от `EventSink`: там,
 #: где событие пишется вместе с изменением в одной транзакции, повторная запись
 #: не нужна — остаётся только раздача.
@@ -38,6 +44,10 @@ class AccountRepository(Protocol):
     async def set_account_state(
         self, account_id: int, state: AccountState, error: str | None = None
     ) -> None: ...
+
+    async def set_account_state_with_event(
+        self, account_id: int, state: AccountState, error: str | None, event: Event
+    ) -> bool: ...
 
     async def save_session(self, account_id: int, payload: dict[str, Any]) -> None: ...
 

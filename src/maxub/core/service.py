@@ -103,7 +103,9 @@ class UserbotService:
             burst=settings.send_burst,
             jitter_seconds=settings.send_jitter_seconds,
         )
-        self._connections = ConnectionManager(storage, transport_factory, settings, self._emit)
+        self._connections = ConnectionManager(
+            storage, transport_factory, settings, self._emit, self._events.publish
+        )
         self._worker = OutboxWorker(
             repo=storage,
             limiter=self._limiter,
@@ -113,7 +115,7 @@ class UserbotService:
             on_auth_lost=self._on_auth_lost,
         )
         self._manual_retry = ManualRetry(storage, self._connections.get, self._events.publish)
-        self._login = LoginService(storage, self._connections)
+        self._login = LoginService(self._set_state, self._connections)
         self._housekeeper = Housekeeper(
             storage,
             retention_days=settings.events_retention_days,
@@ -150,11 +152,12 @@ class UserbotService:
             # новый вход, и попытки только жгли бы отозванную сессию.
             return
         except Exception as exc:
-            # Раньше аккаунт оставался в backoff без надзора и не поднимался до
-            # перезапуска демона. Сеть при старте могла быть ещё не готова —
-            # надзорный цикл продолжит попытки с растущей задержкой сам.
+            # Состояние `backoff` уже выставлено там же, где ошибку и
+            # классифицировали. Здесь остаётся единственное, чего подключение
+            # сделать не могло: завести надзор. Раньше аккаунт оставался в
+            # backoff без него и не поднимался до перезапуска демона — сеть при
+            # старте могла быть ещё не готова, а повторять было некому.
             log.warning("не удалось переподключить аккаунт %s: %s", account.id, exc)
-            await self._set_state(account.id, AccountState.BACKOFF, str(exc))
             self._connections.supervise(account.id, session)
 
     async def stop(self) -> None:
@@ -328,10 +331,12 @@ class UserbotService:
         «записать и рассказать» держится в одном месте, иначе часть переходов
         рано или поздно останется без события.
         """
-        await self._storage.set_account_state(account_id, state, error)
         event = account_state_event(account_id, state, error)
-        if event is not None:
-            await self._emit(event)
+        if event is None:
+            await self._storage.set_account_state(account_id, state, error)
+            return
+        if await self._storage.set_account_state_with_event(account_id, state, error, event):
+            self._events.publish(event)
 
     # --- события ------------------------------------------------------------
 

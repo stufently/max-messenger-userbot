@@ -7,11 +7,19 @@ from typing import Any
 import aiosqlite
 
 from maxub.core.crypto import SecretBox
-from maxub.core.models import Account, AccountState, utcnow
-from maxub.core.storage.base import Database, DuplicateAccountError, parse_dt
+from maxub.core.models import Account, AccountState, Event, utcnow
+from maxub.core.storage.base import DuplicateAccountError, parse_dt
+from maxub.core.storage.events import EventsMixin
 
 
-class AccountsMixin(Database):
+class AccountsMixin(EventsMixin):
+    """Аккаунты и их состояния.
+
+    Наследуется от журнала событий не ради удобства: смена состояния и запись
+    события о ней обязаны попадать в одну транзакцию, а значит должны уметь
+    писать в обе таблицы, не фиксируя изменения по отдельности.
+    """
+
     async def add_account(self, phone: str, label: str | None) -> Account:
         """Добавляет аккаунт.
 
@@ -62,10 +70,46 @@ class AccountsMixin(Database):
         self, account_id: int, state: AccountState, error: str | None = None
     ) -> None:
         async with self.write() as db:
-            await db.execute(
-                "UPDATE accounts SET state = ?, last_error = ?, updated_at = ? WHERE id = ?",
-                (state.value, error, utcnow().isoformat(), account_id),
-            )
+            await self._write_state(db, account_id, state, error)
+
+    async def set_account_state_with_event(
+        self, account_id: int, state: AccountState, error: str | None, event: Event
+    ) -> bool:
+        """Меняет состояние и пишет событие об этом одной транзакцией.
+
+        Двумя отдельными записями это было бы «состояние сменилось, а никто не
+        узнал»: между ними процесс может умереть, задачу — отменить, а вторую
+        запись — не пропустить журнал. Тот же приём, что и при закрытии
+        отправки в
+        [mark_sent_with_event][maxub.core.storage.delivery.DeliveryMixin.mark_sent_with_event],
+        и по той же причине.
+
+        Событие пишется только тогда, когда состояние действительно сменилось.
+        Повторная запись того же состояния — обычное дело: запрос кода ставит
+        аккаунту `auth_required`, а он в нём чаще всего и находится. Событие об
+        этом означало бы переход, которого не было, и заполняло бы журнал шумом
+        ровно там, где от него ждут сигнала.
+
+        Ответ говорит, попало ли событие в журнал: раздавать подписчикам то, что
+        не записано, нельзя — они увидели бы то, чего в истории нет.
+        """
+        async with self.write() as db:
+            async with db.execute(
+                "SELECT state FROM accounts WHERE id = ?", (account_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            changed = row is not None and AccountState(row["state"]) is not state
+            await self._write_state(db, account_id, state, error)
+            return await self.insert_event(event) if changed else False
+
+    @staticmethod
+    async def _write_state(
+        db: aiosqlite.Connection, account_id: int, state: AccountState, error: str | None
+    ) -> None:
+        await db.execute(
+            "UPDATE accounts SET state = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            (state.value, error, utcnow().isoformat(), account_id),
+        )
 
     @staticmethod
     def _account(row: aiosqlite.Row) -> Account:

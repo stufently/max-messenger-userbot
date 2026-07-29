@@ -17,7 +17,7 @@ from maxub.core.challenges import (
     TooManyChallenges,
 )
 from maxub.core.models import Account, AccountState, QrStatus, Session
-from maxub.core.ports import AccountRepository
+from maxub.core.ports import AccountStateWriter
 from maxub.core.sync import ConnectionManager
 from maxub.transport.base import TransportAuthError, TransportUnsupported
 
@@ -25,8 +25,10 @@ __all__ = ["ChallengeGone", "LoginError", "LoginService", "TooManyChallenges"]
 
 
 class LoginService:
-    def __init__(self, repo: AccountRepository, connections: ConnectionManager) -> None:
-        self._repo = repo
+    def __init__(self, set_state: AccountStateWriter, connections: ConnectionManager) -> None:
+        # Хранилище напрямую здесь больше не нужно: вход меняет состояние
+        # аккаунта, а о таких сменах должны узнавать подписчики живого потока.
+        self._set_state = set_state
         self._connections = connections
         self._phone = ChallengeRegistry("challenge_id")
         self._qr = ChallengeRegistry("запрос QR-входа")
@@ -38,7 +40,7 @@ class LoginService:
         self._phone.prepare(account.id)
         challenge = await transport.start_login(account.phone)
         self._phone.add(challenge.challenge_id, account.id, challenge.expires_at)
-        await self._repo.set_account_state(account.id, AccountState.AUTH_REQUIRED)
+        await self._set_state(account.id, AccountState.AUTH_REQUIRED, None)
         return challenge.challenge_id
 
     async def complete_phone(self, challenge_id: str, code: str) -> tuple[int, Session]:
@@ -69,7 +71,7 @@ class LoginService:
         self._qr.prepare(account_id)
         challenge = await transport.start_qr_login()
         self._qr.add(challenge.challenge_id, account_id, challenge.expires_at)
-        await self._repo.set_account_state(account_id, AccountState.AUTH_REQUIRED)
+        await self._set_state(account_id, AccountState.AUTH_REQUIRED, None)
         return challenge.model_dump(mode="json")
 
     async def poll_qr(self, challenge_id: str) -> tuple[QrStatus, int | None, Session | None]:
@@ -104,4 +106,4 @@ class LoginService:
         return QrStatus.CONFIRMED, account_id, session
 
     async def _fail(self, account_id: int, exc: Exception) -> None:
-        await self._repo.set_account_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
+        await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
