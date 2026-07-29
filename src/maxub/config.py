@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from maxub.core.crypto import generate_key
+
+#: Сколько раз пытаться создать файл секрета, уступая соседнему процессу.
+#: Больше двух витков подряд означает, что дело не в гонке, а в неисправности.
+SECRET_CREATE_ATTEMPTS = 3
 
 TOKEN_FILE = "api_token"
 KEY_FILE = "secret.key"
@@ -21,12 +26,43 @@ def _write_secret_file(path: Path, content: str) -> None:
 
     Вариант «записать, потом chmod» оставляет окно, в котором файл доступен по
     umask, — для секретов это неприемлемо.
+
+    ``O_NOFOLLOW`` защищает от подмены пути символической ссылкой, но в Windows
+    такого флага нет вовсе: обращение к нему через ``getattr`` — не небрежность,
+    а единственный способ не уронить импорт там, где защищать нечего (права в
+    каталоге профиля определяет ACL).
     """
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow, 0o600)
     try:
         os.write(fd, content.encode("utf-8"))
     finally:
         os.close(fd)
+
+
+def _create_or_read_secret(path: Path, factory: Callable[[], str]) -> str:
+    """Создаёт секрет либо возвращает уже созданный кем-то другим.
+
+    Два процесса, стартовавшие одновременно на пустом каталоге, оба видят, что
+    файла нет. `O_EXCL` не даёт им затереть работу друг друга, но проигравший
+    получал `FileExistsError` и падал ещё до запуска. Проигравшему нужен не
+    отказ, а значение победителя — оно уже на диске.
+    """
+    for _ in range(SECRET_CREATE_ATTEMPTS):
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        value = factory()
+        try:
+            _write_secret_file(path, value)
+        except FileExistsError:
+            # Файл создал соседний процесс между проверкой и записью — читаем
+            # его на следующем витке. Пустой файл (успели создать, но ещё не
+            # записали) тоже разрешается повтором.
+            continue
+        return value
+    raise RuntimeError(f"не удалось создать файл секрета: {path}")
 
 
 class Settings(BaseSettings):
@@ -104,14 +140,7 @@ class Settings(BaseSettings):
         if self.token:
             return self.token
         self.ensure_data_dir()
-        path = self.token_path
-        if path.exists():
-            existing = path.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        token = secrets.token_urlsafe(32)
-        _write_secret_file(path, token)
-        return token
+        return _create_or_read_secret(self.token_path, lambda: secrets.token_urlsafe(32))
 
     def resolve_secret_key(self) -> str:
         """Возвращает ключ шифрования сессий, создавая его при первом запуске.
@@ -122,14 +151,7 @@ class Settings(BaseSettings):
         if self.secret_key:
             return self.secret_key
         self.ensure_data_dir()
-        path = self.secret_key_path
-        if path.exists():
-            existing = path.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        key = generate_key()
-        _write_secret_file(path, key)
-        return key
+        return _create_or_read_secret(self.secret_key_path, generate_key)
 
 
 class ClientSettings(BaseSettings):

@@ -1,5 +1,10 @@
 # MAX Userbot — автоматизация пользовательских аккаунтов в мессенджере МАКС (max.ru)
 
+[![ci](https://github.com/stufently/max-messenger-userbot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stufently/max-messenger-userbot/actions/workflows/ci.yml)
+[![windows-build](https://github.com/stufently/max-messenger-userbot/actions/workflows/windows-build.yml/badge.svg?branch=main)](https://github.com/stufently/max-messenger-userbot/actions/workflows/windows-build.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Юзербот для мессенджера MAX: платформа автоматизации действий от имени обычного
 пользовательского аккаунта — мультиаккаунт, пересылка сообщений, планировщик,
 плагины.
@@ -39,6 +44,7 @@
 - **Локальный API** — HTTP и WebSocket, только на петлевом интерфейсе, с
   обязательным токеном.
 - **Два CLI** — `maxub` для человека и `maxubctl` для скриптов и агентов.
+- **Сборка под Windows** — один `maxub.exe` без установки Python.
 - **Docker** — сборка, запуск и тесты.
 
 Транспорт пока заглушечный (`stub`): весь путь проверяется без реального
@@ -50,6 +56,28 @@
   преобразованием текста, живая синхронизация.
 - **Планировщик** — отложенные и повторяющиеся отправки.
 - **Плагины** — модульное ядро, свои сценарии без правки самого ядра.
+
+## Windows: один файл
+
+Скачайте `maxub.exe` из [релизов](https://github.com/stufently/max-messenger-userbot/releases)
+и запустите двойным щелчком. Установка Python не нужна, командная строка тоже:
+демон поднимается сам на свободном порту, браузер открывается на панели, а токен
+кладётся в буфер обмена — его остаётся вставить в форму входа.
+
+Данные лежат в `%LOCALAPPDATA%\maxub`: база с сессиями, токен, `launcher.log`.
+Второй запуск не поднимает вторую копию, а открывает панель уже работающей —
+две копии на одной базе означали бы две очереди отправки и два соединения одного
+аккаунта.
+
+Рядом лежит `maxubctl.exe` — консольный клиент для скриптов и агентов, он сам
+находит адрес работающего демона. Обычному пользователю он не нужен.
+
+Файл не подписан, поэтому при первом запуске Windows покажет предупреждение
+SmartScreen. Собрать самому:
+
+```bash
+bash packaging/windows/build.sh   # результат в dist/windows/
+```
 
 ## Быстрый старт
 
@@ -167,6 +195,12 @@ docker compose exec userbot maxubctl events --after-id 12
 
 Каталог `data/` внесён в `.gitignore` — секреты не должны попадать в
 репозиторий.
+
+В Windows права на файлы задаются не битами доступа, а ACL: биты там ничего не
+решают, и код их не трогает. Защиту даёт сам `%LOCALAPPDATA%` — доступ к нему
+есть у владельца, SYSTEM и администраторов. Если задать свой каталог через
+`MAXUB_DATA_DIR`, его права придётся обеспечить самостоятельно: положив данные в
+общедоступное место, вы отдадите туда и токен, и базу с сессиями.
 
 ## Разработка
 

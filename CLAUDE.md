@@ -50,6 +50,10 @@ src/maxub/
     static/          страница панели: HTML, CSS и ванильный JS без сборщиков
     security.py      bearer-токен локального API
   cli/               клиенты `maxub` и `maxubctl`
+  winlauncher.py     точка входа exe: демон плюс панель в браузере
+  winhost.py         обвязка Windows: каталог данных, порт, журнал, мьютекс
+packaging/windows/   сборка автономного exe: образ с Wine, спека PyInstaller
+.github/workflows/   CI: проверки, сборка под Windows, релиз по тегу
 tests/               тесты ядра, API, доставки, QR, миграций, веб-панели и CLI
 ```
 

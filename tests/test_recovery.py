@@ -91,9 +91,7 @@ class UnbufferedStub(StubTransport):
             await self.push_incoming(chat_id, text)
         return result
 
-    async def push_incoming(
-        self, chat_id: str, text: str, sender_id: str = "stub-peer"
-    ) -> Message:
+    async def push_incoming(self, chat_id: str, text: str, sender_id: str = "stub-peer") -> Message:
         if not self._listening:
             # Слушателя нет — событие проходит мимо потока и остаётся только в
             # журнале сервера.

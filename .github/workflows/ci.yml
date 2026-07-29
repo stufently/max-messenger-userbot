@@ -1,0 +1,175 @@
+# Основной прогон проверок: линтер, типы, тесты, образ и колесо.
+#
+# Проверки те же, что гоняются вручную в Docker, — расхождение между «локально
+# зелено» и «в CI зелено» стоит дороже, чем лишняя работа в матрице.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# По умолчанию токену нужно только чтение кода: ни один job здесь ничего не
+# публикует и не пишет в репозиторий.
+permissions:
+  contents: read
+
+# Пуш поверх пуша в ту же ветку отменяет предыдущий прогон: результат старого
+# коммита всё равно никому не нужен, а минуты раннера расходуются.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Версия, на которой собирается рабочий образ, — она же основная для проверок,
+  # которые не размножаются по матрице.
+  PRIMARY_PYTHON: "3.12"
+
+jobs:
+  static:
+    name: Линтер и типы
+    runs-on: ubuntu-latest
+    steps:
+      # Все actions закреплены по SHA, а не по тегу: тег в чужом репозитории
+      # можно переставить на другой коммит, и в прогон приедет чужой код.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PRIMARY_PYTHON }}
+          cache: pip
+          # Лок-файла в проекте нет, ключ кэша считается по объявлению
+          # зависимостей — этого достаточно, чтобы кэш инвалидировался при
+          # правке зависимостей и переиспользовался в остальных случаях.
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with dev extras
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        # Форматирование проверяется отдельно от правил: спор о переносах не
+        # должен выглядеть как ошибка в коде.
+        run: ruff format --check .
+
+      - name: mypy
+        # Область типизации ровно та же, что в pyproject: пакет `maxub`, без
+        # тестов. Расширять её здесь нельзя — CI разошёлся бы с локальным
+        # прогоном.
+        run: mypy src/maxub
+
+  tests:
+    name: Тесты (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 — нижняя граница из `requires-python`, 3.12 — версия рабочего
+        # образа, 3.13 — версия, на которой собирается Windows-exe. Все три
+        # реально используются, поэтому все три проверяются.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with dev extras
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev]"
+
+      - name: pytest
+        run: python -m pytest -q
+
+  docker:
+    name: Образ и тесты внутри него
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Собирается штатным `docker build` без docker/*-actions: образ никуда не
+      # публикуется, а лишний внешний action — лишняя зависимость в цепочке
+      # поставки.
+      - name: Build image
+        run: docker build -t max-userbot:ci .
+
+      - name: Run tests inside the image
+        # Корневой Dockerfile не копирует `tests/` (в образе для пользователя
+        # им нечего делать), поэтому каталог подкидывается монтированием — так
+        # проверяется ровно тот установленный пакет, который получает
+        # пользователь, а не исходники из рабочей копии.
+        # `-p no:cacheprovider` — чтобы pytest не пытался писать .pytest_cache
+        # в примонтированный только для чтения каталог.
+        run: |
+          docker run --rm \
+            -v "$PWD/tests:/app/tests:ro" \
+            -w /app \
+            -e MAXUB_DATA_DIR=/tmp/data \
+            max-userbot:ci \
+            python -m pytest -q -p no:cacheprovider
+
+  package:
+    name: Колесо и статика веб-панели
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PRIMARY_PYTHON }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build backend
+        run: python -m pip install --upgrade pip && python -m pip install build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Check web panel assets are inside the wheel
+        # Статика не импортируется кодом, поэтому её пропажу из сборки не
+        # поймает ни один тест: установленный пакет молча отдаст 404 на панель.
+        # Сравнение идёт с содержимым каталога в репозитории — так проверка
+        # переживёт добавление новых файлов панели.
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          static_dir = Path("src/maxub/api/static")
+          expected = {
+              f"maxub/api/static/{p.name}"
+              for p in static_dir.iterdir()
+              if p.suffix in {".html", ".css", ".js"}
+          }
+          if not expected:
+              sys.exit("в src/maxub/api/static нет файлов панели — проверять нечего")
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+          missing = sorted(expected - names)
+          if missing:
+              sys.exit(f"в колесе {wheel} нет файлов панели: {missing}")
+          print(f"{wheel}: статика на месте ({len(expected)} файлов)")
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dists
+          path: dist/*
+          if-no-files-found: error

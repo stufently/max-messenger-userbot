@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -153,7 +154,13 @@ class Database:
 
         В базе лежат сессии аккаунтов, а SQLite создаёт файлы по umask, то есть
         обычно 0644. Права выставляются и на WAL с SHM — данные попадают и туда.
+
+        В Windows этого не делается: биты режима там ничего не решают (доступ
+        определяет ACL каталога профиля), зато `chmod` по открытому SQLite файлу
+        `-shm` падает с «файл занят другим процессом» и демон не стартует вовсе.
         """
+        if sys.platform == "win32":
+            return
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self._path}{suffix}")
             if candidate.exists():

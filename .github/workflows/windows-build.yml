@@ -1,0 +1,63 @@
+# Релизный exe собирается нативно на Windows, а не под Wine.
+#
+# Wine в контейнере нужен, чтобы собрать сборку с Linux-машины разработчика, но
+# артефакт для пользователей должен собираться тем же способом, каким его будут
+# запускать: у Wine свои особенности (нереализованные функции WinAPI, чужой
+# загрузчик), и расхождение обнаружилось бы уже у пользователя. Спека при этом
+# одна и та же — packaging/windows/maxub.spec.
+name: windows-build
+
+on:
+  push:
+    branches: [main]
+  # Релизный workflow вызывает эту сборку как переиспользуемую и забирает
+  # артефакт в пределах своего прогона. Отдельного запуска по тегу здесь нет:
+  # иначе один и тот же exe собирался бы дважды.
+  workflow_call:
+  pull_request:
+    paths:
+      - "packaging/windows/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # Только официальные actions/*, версия закреплена по SHA: тег может быть
+      # переставлен на другой коммит, и в сборку приедет чужой код.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # Та же версия, что зафиксирована в packaging/windows/Dockerfile:
+          # сборки под Wine и на раннере должны совпадать по интерпретатору.
+          python-version: "3.13.14"
+
+      - name: Install project and build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install pyinstaller==6.21.0
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --clean packaging/windows/maxub.spec
+
+      - name: Show artifacts
+        run: Get-ChildItem dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maxub-windows
+          path: |
+            dist/maxub.exe
+            dist/maxubctl.exe
+          if-no-files-found: error

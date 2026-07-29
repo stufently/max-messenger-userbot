@@ -1,0 +1,14 @@
+# Actions в workflow закреплены по SHA — вручную такие пины не обновляют.
+# Dependabot поднимает их сам и подписывает комментарий с версией, поэтому
+# закрепление по хешу не превращается в вечно устаревшие зависимости.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      # Короткий заголовок в повелительном наклонении — как принято в проекте.
+      prefix: Update
