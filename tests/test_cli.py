@@ -13,12 +13,14 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
+import click
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
 from maxub.api.app import create_app
 from maxub.cli import client as client_module
+from maxub.cli import errors as cli_errors
 from maxub.cli.main import _run
 from maxub.config import Settings
 from maxub.transport.stub import STUB_CODE
@@ -229,3 +231,47 @@ def test_ctl_entry_point_defaults_to_json(
 def test_uvicorn_is_importable() -> None:
     """Демон должен собираться в этом же окружении."""
     assert hasattr(uvicorn, "Server")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["send"], id="пропущена обязательная опция"),
+        pytest.param(["nosuchcmd"], id="неизвестная команда"),
+        pytest.param(["--timeout", "abc", "status"], id="непреобразуемое значение"),
+        pytest.param(["accounts"], id="группа без подкоманды"),
+    ],
+)
+def test_usage_errors_exit_two(
+    args: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ошибка аргументов — это код 2 и внятное сообщение, а не трейсбек.
+
+    Код объявлен в README частью контракта: `maxubctl` вызывают из скриптов, и
+    отличать «не так вызвали» от «не сработало» они должны по коду.
+    """
+    monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MAXUB_TOKEN", "irrelevant")
+
+    assert _run_cli(args) == client_module.EXIT_USAGE
+
+
+def test_help_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
+    assert _run_cli(["--help"]) == client_module.EXIT_OK
+
+
+def test_vendored_click_exceptions_are_covered() -> None:
+    """Копия click внутри typer обязана попадать в обработчики.
+
+    Это корень ошибки, ради которой заведён `cli/errors.py`: у вендорной копии
+    собственное дерево классов, не пересекающееся с внешним click, поэтому
+    `except click.ClickException` пропускал ошибки разбора аргументов мимо.
+    Проверка держит связь с обеими копиями при обновлении typer.
+    """
+    vendored = pytest.importorskip("typer._click")
+
+    assert issubclass(vendored.exceptions.MissingParameter, cli_errors.USAGE)
+    assert issubclass(vendored.exceptions.UsageError, cli_errors.USAGE)
+    assert issubclass(vendored.exceptions.Exit, cli_errors.EXITS)
+    assert issubclass(click.ClickException, cli_errors.USAGE)

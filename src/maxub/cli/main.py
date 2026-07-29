@@ -15,12 +15,12 @@ import sys
 from pathlib import Path
 from typing import Annotated
 
-import click
 import typer
 
+from maxub.cli import errors
 from maxub.cli.client import EXIT_OK, EXIT_USAGE, ApiClient, ApiError
 from maxub.cli.commands import accounts, login, messages
-from maxub.cli.context import Context, fail, stderr, stdout
+from maxub.cli.context import Context, fail, stdout
 from maxub.config import ClientSettings, Settings
 
 app = typer.Typer(
@@ -90,12 +90,12 @@ def _run(argv: list[str] | None = None) -> None:
         app(args=argv, standalone_mode=False)
     except ApiError as exc:
         fail(str(exc), exc.exit_code)
-    except (typer.Exit, click.exceptions.Exit) as exc:
-        raise SystemExit(exc.exit_code) from exc
-    except click.ClickException as exc:
-        stderr.print(f"[red]{exc.format_message()}[/red]")
-        raise SystemExit(EXIT_USAGE) from exc
-    except click.exceptions.Abort as exc:
+    except errors.EXITS as exc:
+        raise SystemExit(errors.exit_code_of(exc, EXIT_OK)) from exc
+    except errors.USAGE as exc:
+        errors.show(exc)
+        raise SystemExit(errors.exit_code_of(exc, EXIT_USAGE)) from exc
+    except errors.ABORTS as exc:
         raise SystemExit(EXIT_USAGE) from exc
     raise SystemExit(EXIT_OK)
 
