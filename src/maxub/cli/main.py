@@ -18,10 +18,11 @@ from typing import Annotated
 import typer
 
 from maxub.cli import errors
-from maxub.cli.client import EXIT_OK, EXIT_USAGE, ApiClient, ApiError
+from maxub.cli.client import EXIT_ERROR, EXIT_OK, EXIT_USAGE, ApiClient, ApiError
 from maxub.cli.commands import accounts, login, messages, tokens
 from maxub.cli.context import Context, fail, stdout
 from maxub.config import ClientSettings, Settings
+from maxub.paths import DataDirError
 
 app = typer.Typer(
     add_completion=False,
@@ -95,6 +96,11 @@ def _run(argv: list[str] | None = None) -> None:
         app(args=argv, standalone_mode=False)
     except ApiError as exc:
         fail(str(exc), exc.exit_code)
+    except DataDirError as exc:
+        # Каталог данных недоступен — это не ошибка вызова (код 2), а отказ на
+        # старте: сообщение уже написано словами, печатать к нему трассировку
+        # значит прятать его в шуме.
+        fail(str(exc), EXIT_ERROR)
     except errors.EXITS as exc:
         raise SystemExit(errors.exit_code_of(exc, EXIT_OK)) from exc
     except errors.USAGE as exc:

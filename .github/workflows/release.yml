@@ -116,8 +116,87 @@ jobs:
     # он выкладывает сам, и в пределах одного прогона его забирает job publish.
     uses: ./.github/workflows/windows-build.yml
 
+  image:
+    name: Образ в GHCR
+    needs: version
+    runs-on: ubuntu-latest
+    # `packages: write` — только этой работе: остальным публиковать нечего.
+    # `contents: read` указан явно, потому что блок `permissions` на уровне
+    # работы обнуляет всё, что в нём не перечислено, — без этой строки не
+    # сработал бы даже checkout.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Ни `docker/*`-actions, ни buildx, ни binfmt: образ собирается штатным
+      # `docker build`, а публикуется штатным `docker push`. Пока архитектура
+      # одна (amd64), buildx не даёт ничего, кроме третьей стороны в цепочке
+      # поставки; для arm64 понадобится privileged-контейнер с эмуляцией, и это
+      # отдельная работа (заведена в TASKS.md).
+      #
+      # Имя владельца берётся из окружения и приводится к нижнему регистру:
+      # в GHCR имена только строчные, а `github.repository_owner` сохраняет
+      # регистр как в профиле.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/max-userbot"
+          docker build --build-arg EXTRAS=pymax -t "${image}:${version}" .
+          echo "IMAGE=${image}" >> "$GITHUB_ENV"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Smoke-test the image before publishing
+        # Порядок здесь и есть смысл шага: `docker push` уже выкладывает образ,
+        # и проверка после него ничего не предотвращает. Отправляются ровно те
+        # байты, что проверены, — между проверкой и отправкой пересборки нет.
+        run: bash packaging/docker/smoke.sh "${IMAGE}:${VERSION}"
+
+      - name: Log in to GHCR
+        # Токен идёт в docker login через stdin, а не аргументом: аргументы
+        # видны в списке процессов и оседают в истории оболочки.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push the image
+        # Точная версия — чтобы можно было закрепиться намертво; минорная — чтобы
+        # получать исправления внутри неё; latest — для тех, кому нужно просто
+        # «последнее».
+        #
+        # Плавающие теги двигает только выпуск вида X.Y.Z. Триггер этого workflow
+        # — `tags: ["v*"]`, то есть `v0.3.0rc1` тоже сюда попадёт, и без проверки
+        # предвыпуск увёл бы за собой и `0.3`, и `latest`: тот, кто ничего не
+        # просил, получил бы release candidate. Сам предвыпуск при этом
+        # публикуется под своей точной версией — забрать его можно, наступить
+        # случайно нельзя.
+        run: |
+          set -euo pipefail
+          tags=("$VERSION")
+          if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              tags+=("${VERSION%.*}" latest)
+          else
+              echo "$VERSION — предвыпуск: плавающие теги не двигаются"
+          fi
+          for tag in "${tags[@]}"; do
+              docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${tag}"
+              docker push "${IMAGE}:${tag}"
+          done
+          docker logout ghcr.io
+
   publish:
     name: Публикация релиза
+    # Образа в списке нет намеренно. Файлы релиза (колесо, sdist, exe) не
+    # зависят от реестра, а публикация в GHCR зависит от настроек пакета,
+    # которые задаются в веб-интерфейсе руками: первая отправка создаёт пакет
+    # приватным. Свяжи их — и заминка в настройках реестра задержала бы выпуск
+    # файлов, которым реестр не нужен. Отказ работы `image` виден по красному
+    # прогону и лечится перезапуском именно этой работы на том же теге, без
+    # выпуска нового.
     needs: [dists, windows]
     runs-on: ubuntu-latest
     # Право на запись выдаётся только этой работе: сборка обходится чтением, а

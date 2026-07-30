@@ -7,10 +7,11 @@
 отдельным консольным exe. Обычному пользователю он не нужен и в релизе идёт
 рядом как дополнительный файл, а не как замена основному.
 
-Клиент по умолчанию ищет токен в `/data` и стучится на 127.0.0.1:8765 — это
-значения для контейнера. В Windows каталог другой, а порт лаунчер выбирает
-свободный, поэтому здесь подставляются значения текущего запуска. Именно
-`setdefault`: заданные пользователем `MAXUB_*` остаются главнее.
+Каталог данных клиент выбирает сам и в Windows приходит туда же, куда лаунчер
+(`%LOCALAPPDATA%\\maxub`), — здесь он подставляется в окружение, чтобы попасть и
+в дочерние процессы. А вот порт по умолчанию — 8765, тогда как лаунчер берёт
+свободный, поэтому адрес работающего демона читается из его файла состояния.
+Именно `setdefault`: заданные пользователем `MAXUB_*` остаются главнее.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ import sys
 from pathlib import Path
 
 from maxub.cli.main import ctl
-from maxub.winhost import default_data_dir, running_instance
+from maxub.paths import default_data_dir
+from maxub.winhost import running_instance
 from maxub.winlauncher import HEALTH_PATH
 
 

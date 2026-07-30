@@ -245,3 +245,27 @@ def _resolve_token_in_parallel(
     for thread in threads:
         thread.join(timeout=10)
     return results, errors
+
+
+# --- отказ каталога данных ----------------------------------------------------
+
+
+def test_broken_data_dir_shows_a_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Отказ каталога — окно с текстом и код 1, а не необработанное исключение.
+
+    Проверка появилась после ревью: `ensure_data_dir` стал бросать свой
+    `DataDirError`, а лаунчер ловил только `OSError`, и для пользователя exe без
+    консоли это выглядело бы как «щёлкнул — ничего не произошло». Трассировке в
+    оконном процессе выводиться некуда, поэтому показать окно — единственный
+    способ хоть что-то сообщить.
+    """
+    occupied = tmp_path / "занято"
+    occupied.write_text("не каталог", encoding="utf-8")
+    monkeypatch.setenv("MAXUB_DATA_DIR", str(occupied))
+
+    shown: list[str] = []
+    monkeypatch.setattr(winlauncher, "show_error", lambda message: shown.append(message))
+
+    assert winlauncher.main() == 1
+    assert len(shown) == 1
+    assert "MAXUB_DATA_DIR" in shown[0]

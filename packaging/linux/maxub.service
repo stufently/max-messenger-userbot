@@ -1,0 +1,75 @@
+; Пользовательский юнит systemd: ~/.config/systemd/user/maxub.service
+;
+; Именно пользовательский, а не системный. Демон держит сессии личного аккаунта
+; и ключ шифрования, привязанный к учётной записи; под root он получил бы права,
+; которые ему не нужны, а хранилище ключей ОС (Secret Service) живёт в сеансе
+; пользователя и из системного юнита недоступно вовсе.
+;
+; Установка:
+;   pipx install "max-userbot[pymax,keyring]"
+;   mkdir -p ~/.local/share/maxub ~/.config/systemd/user
+;   cp packaging/linux/maxub.service ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now maxub
+;
+; Чтобы демон работал без входа в сеанс: `loginctl enable-linger $USER`. Без
+; этого systemd гасит пользовательские юниты при выходе.
+
+[Unit]
+Description=MAX Userbot — автоматизация пользовательских аккаунтов MAX
+Documentation=https://github.com/stufently/max-messenger-userbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+; Путь pipx. Для установки в свой venv замените на его каталог, например
+; %h/.local/share/maxub-venv/bin/maxub.
+ExecStart=%h/.local/bin/maxub daemon
+
+; Каталог данных задан явно, хотя программа и сама выбрала бы то же место.
+; Причина ниже, в ReadWritePaths: путь по умолчанию зависит от XDG_DATA_HOME,
+; то есть от переменной окружения, а список путей для записи задаётся здесь
+; заранее и подстроиться под неё не может. Меняете каталог — меняйте обе строки.
+Environment=MAXUB_DATA_DIR=%h/.local/share/maxub
+
+; Заглушка, а не живой транспорт: юнит, включённый по копии из репозитория, не
+; должен сам полезть в MAX. Меняется на pymax осознанно.
+Environment=MAXUB_TRANSPORT=stub
+
+Restart=on-failure
+RestartSec=5
+
+; Демон переживает разрыв сети сам (надзор за соединением и переподключение —
+; в core/supervisor.py), поэтому Restart нужен только на настоящие падения.
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+; ProtectSystem=strict делает всю файловую систему только для чтения, поэтому
+; каталог данных открывается обратно поимённо.
+;
+; Открыт родитель, а не сам `maxub`: systemd отказывается запускать юнит, если
+; путь из ReadWritePaths не существует, — а на чистой установке каталога данных
+; ещё нет, его создаёт сам демон при первом запуске. Префикс `-` тут не помог бы:
+; он лишь пропустил бы несуществующий путь, и создать каталог под
+; ProtectSystem=strict всё равно было бы нельзя. Права на сам каталог демон
+; выставляет сам — 0700.
+;
+; Меняете MAXUB_DATA_DIR — меняйте и эту строку на родителя нового пути.
+ReadWritePaths=%h/.local/share
+
+; Что здесь НЕ задано и почему: ProtectHome и PrivateUsers. Первый отрезал бы
+; домашний каталог, где и лежат данные. Второй ломает обращение к Secret Service
+; (GNOME Keyring, KWallet): оно идёт через сокет сессионной шины в
+; /run/user/%U, и без него ключ шифрования молча уехал бы в файл рядом с базой
+; вместо хранилища ОС. Если хранилище не нужно, честнее сказать это прямо:
+; Environment=MAXUB_SECRET_KEY_STORE=file
+
+[Install]
+WantedBy=default.target

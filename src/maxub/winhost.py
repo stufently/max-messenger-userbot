@@ -26,7 +26,6 @@ from typing import IO
 
 from maxub.config import Settings
 
-APP_DIR_NAME = "maxub"
 RUNTIME_FILE = "runtime.json"
 INSTANCE_LOCK_FILE = "instance.lock"
 LOG_FILE = "launcher.log"
@@ -34,28 +33,15 @@ LOG_FILE = "launcher.log"
 log = logging.getLogger(__name__)
 
 
-def default_data_dir() -> Path:
-    """Каталог данных: `%LOCALAPPDATA%\\maxub`.
-
-    Значение по умолчанию из `Settings` (`/data`) — это путь тома в контейнере,
-    в Windows его писать некуда. `LOCALAPPDATA` выбран вместо `Roaming`
-    осознанно: в каталоге лежат БД с сессиями и токен, их нельзя таскать за
-    пользователем по перемещаемому профилю.
-
-    Про права. `Settings.ensure_data_dir` делает `chmod 0700`; в Windows это
-    меняет только атрибут «только для чтения» и никого не ограничивает. Защита
-    там держится на ACL профиля: каталог наследует права `%LOCALAPPDATA%`, где
-    доступ есть у владельца, SYSTEM и администраторов. Отдельно ужесточать ACL
-    смысла нет — администратор и так читает чужие профили.
-    """
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        return Path(local) / APP_DIR_NAME
-    if sys.platform == "win32":
-        return Path.home() / "AppData" / "Local" / APP_DIR_NAME
-    # Не-Windows встречается только при отладке сборки (например, под Wine в
-    # контейнере, где LOCALAPPDATA может быть не задан).
-    return Path.home() / f".{APP_DIR_NAME}"
+# Выбор каталога данных живёт в [maxub.paths][], потому что он один и тот же для
+# exe и для обычной установки: `Settings` берёт его по умолчанию сама. Здесь
+# осталось только замечание про права, которое к самому пути не относится.
+#
+# `Settings.ensure_data_dir` делает `chmod 0700`; в Windows это меняет лишь
+# атрибут «только для чтения» и никого не ограничивает. Защита там держится на
+# ACL профиля: каталог наследует права `%LOCALAPPDATA%`, где доступ есть у
+# владельца, SYSTEM и администраторов. Отдельно ужесточать ACL смысла нет —
+# администратор и так читает чужие профили.
 
 
 def pick_free_port() -> int:

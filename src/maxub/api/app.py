@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Sequence
 
 from fastapi import FastAPI
 
+from maxub import __version__
 from maxub.api.routes import router, web_router
 from maxub.config import Settings
 from maxub.core.access import AccessControl
@@ -44,7 +45,7 @@ def create_app(settings: Settings | None = None, handlers: Sequence[EventHandler
     app = FastAPI(
         title="MAX Userbot",
         summary="Локальный API демона. Наружу не выставляется.",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.settings = settings

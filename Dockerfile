@@ -12,6 +12,14 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     MAXUB_DATA_DIR=/data
 
+# Метки OCI. `image.source` — не украшение: по ней GitHub привязывает пакет в
+# GHCR к репозиторию, а от этой привязки зависит и доступ прогона к пакету, и
+# ссылка на исходники на его странице.
+LABEL org.opencontainers.image.source="https://github.com/stufently/max-messenger-userbot" \
+      org.opencontainers.image.title="max-userbot" \
+      org.opencontainers.image.description="Юзербот для мессенджера MAX: автоматизация пользовательских аккаунтов" \
+      org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
@@ -35,14 +43,37 @@ COPY src ./src
 # CI гонял бы тесты в одном, а пользователь запускал другой, и расхождение
 # всплыло бы только в проде. Цена одного образа — десяток лишних пакетов
 # (aiohttp, websockets, zstandard) и пара мегабайт; цена двух — вторая матрица
-# сборки и проверок. `dev` тут же по той же причине: в этом образе CI гоняет
-# весь набор тестов.
+# сборки и проверок.
+#
+# А вот `dev` — аргумент, а не константа, и это единственное различие между двумя
+# образами из этого файла. По умолчанию он внутри: в этом же образе CI гоняет
+# весь набор тестов, и проверять надо ровно то, что установлено, а не исходники
+# из рабочей копии. Публикуемый образ собирается с `--build-arg EXTRAS=pymax` —
+# без pytest, mypy и ruff, которым в чужом рантайме делать нечего. Два
+# независимых Dockerfile со временем разошлись бы, и пользователь получал бы
+# образ, собранный не так, как проверенный.
+ARG EXTRAS=dev,pymax
 RUN PIP_CONSTRAINT=/app/packaging/constraints.txt \
     PIP_BUILD_CONSTRAINT=/app/packaging/constraints.txt \
-    pip install --no-cache-dir .[dev,pymax]
+    pip install --no-cache-dir ".[${EXTRAS}]"
 
-# Каталог данных монтируется снаружи; владельца задаёт `user:` в compose.
-RUN mkdir -p /data
+# Работа от непривилегированного пользователя. Каталог данных принадлежит ему:
+# демон делает `chmod 0700` на нём и создаёт там токен с БД сессий, то есть без
+# владения не запустится вовсе.
+#
+# UID задан числом (10001), а не выдан системой: он попадает в права файлов на
+# смонтированном томе, и «какой достался при сборке» означало бы, что при
+# пересборке образа данные внезапно оказались чужими. Bind-mount с хоста — это
+# отдельный разговор: там владелец уже есть, и его UID образу не подчиняется,
+# поэтому запускать надо с `--user "$(id -u):$(id -g)"`. Named volume Docker
+# создаёт по правам этого каталога, и с ним ничего указывать не нужно. Оба пути
+# описаны в README.
+RUN groupadd --gid 10001 maxub \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin maxub \
+    && mkdir -p /data \
+    && chown maxub:maxub /data
+
+USER maxub
 
 EXPOSE 8765
 

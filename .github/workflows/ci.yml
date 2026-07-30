@@ -160,6 +160,39 @@ jobs:
             max-userbot:ci \
             python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); print(t.name, t.capabilities.send_text)"
 
+      # Публикуемый образ отличается от проверенного выше одним аргументом
+      # (`EXTRAS=pymax` вместо `dev,pymax`), и этого достаточно, чтобы он повёл
+      # себя иначе: pytest внутри есть у одного и нет у другого. Собирается он
+      # здесь на каждом пуше, а не только по тегу, — иначе поломка публикуемой
+      # формы обнаруживалась бы в момент релиза, когда её меньше всего ждут.
+      - name: Build the published image shape
+        run: docker build --build-arg EXTRAS=pymax -t max-userbot:release .
+
+      - name: Smoke-test the published image
+        # Тот же скрипт, что запускает release.yml перед публикацией: демон
+        # поднимается, healthcheck зеленеет, токен выдаётся — и это проверяется
+        # на named volume и на bind-mount с UID хоста, потому что оба способа
+        # описаны в README и ведут себя по-разному.
+        run: bash packaging/docker/smoke.sh max-userbot:release
+
+      - name: The published image carries no development tools
+        # Иначе `EXTRAS` мог бы тихо перестать действовать (например, после
+        # правки строки установки), и пользователи получали бы образ с pytest,
+        # mypy и ruff внутри.
+        run: |
+          docker run --rm max-userbot:release python - <<'PY'
+          import importlib.util as util
+          import sys
+
+          missing = [name for name in ("pymax", "httpx") if util.find_spec(name) is None]
+          extra = [name for name in ("pytest", "mypy", "ruff") if util.find_spec(name) is not None]
+          if missing:
+              sys.exit(f"в публикуемом образе нет обязательного: {', '.join(missing)}")
+          if extra:
+              sys.exit(f"в публикуемом образе лишнее из dev: {', '.join(extra)}")
+          print("состав публикуемого образа верный")
+          PY
+
   versions:
     name: Версии Python согласованы
     runs-on: ubuntu-latest

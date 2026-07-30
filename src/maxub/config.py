@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from maxub.core import keystore
 from maxub.core.crypto import generate_key
 from maxub.core.keystore_backends import open_keystore
+from maxub.paths import DataDirError, default_data_dir
 
 #: Сколько раз пытаться создать файл секрета, уступая соседнему процессу.
 #: Больше двух витков подряд означает, что дело не в гонке, а в неисправности.
@@ -77,7 +78,12 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MAXUB_", extra="ignore")
 
-    data_dir: Path = Field(default=Path("/data"))
+    # Значение вычисляется при создании настроек, а не при импорте: иначе оно
+    # запомнилось бы один раз на процесс, и тесты (как и запуск с подменённым
+    # `HOME`) видели бы чужой каталог. Тот же дефолт обязан быть у
+    # `ClientSettings` ниже — демон создаёт токен в каталоге, а `maxub` его там
+    # ищет, и разойтись им нельзя.
+    data_dir: Path = Field(default_factory=default_data_dir)
     host: str = Field(default="127.0.0.1")
     port: int = Field(default=8765)
     token: str | None = Field(default=None)
@@ -164,9 +170,25 @@ class Settings(BaseSettings):
 
         В каталоге лежат токен API и БД с сессиями аккаунтов — читать их не
         должен никто, кроме владельца процесса.
+
+        Отказ объясняется словами, а не трассировкой: с дефолтом `/data` самой
+        частой ошибкой запуска был именно отказ доступа, и человеку надо знать,
+        какой каталог поправить и какой переменной его сменить.
         """
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.data_dir.chmod(0o700)
+        if self.data_dir.exists() and not self.data_dir.is_dir():
+            raise DataDirError(
+                f"каталог данных {self.data_dir} — не каталог."
+                " Уберите этот файл или задайте другой путь в MAXUB_DATA_DIR"
+            )
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.data_dir.chmod(0o700)
+        except OSError as exc:
+            raise DataDirError(
+                f"каталог данных {self.data_dir} недоступен: {exc}."
+                " Дайте права текущему пользователю или задайте другой путь"
+                " в MAXUB_DATA_DIR"
+            ) from exc
 
     def resolve_token(self) -> str:
         """Возвращает токен API, создавая его при первом запуске.
@@ -273,7 +295,8 @@ class ClientSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MAXUB_", extra="ignore")
 
-    data_dir: Path = Field(default=Path("/data"))
+    # Тот же дефолт, что у `Settings`: клиент читает токен из этого каталога.
+    data_dir: Path = Field(default_factory=default_data_dir)
     host: str = Field(default="127.0.0.1")
     port: int = Field(default=8765)
     token: str | None = Field(default=None)

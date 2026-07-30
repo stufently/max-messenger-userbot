@@ -25,10 +25,10 @@ import webbrowser
 
 from maxub.config import Settings
 from maxub.daemon import serve
+from maxub.paths import DataDirError
 from maxub.winhost import (
     acquire_single_instance,
     configure_logging,
-    default_data_dir,
     drop_runtime,
     pick_free_port,
     probe_health,
@@ -86,10 +86,12 @@ def build_settings() -> Settings:
 
     Переменные `MAXUB_*` не перетираются: они позволяют запустить ту же сборку
     с чужим каталогом данных или на фиксированном порту.
+
+    Каталог данных тут больше не подменяется: `Settings` сам берёт по умолчанию
+    `%LOCALAPPDATA%\\maxub` (см. [maxub.paths][]). Раньше подмена была нужна,
+    потому что дефолтом был путь тома в контейнере.
     """
     settings = Settings()
-    if "MAXUB_DATA_DIR" not in os.environ:
-        settings.data_dir = default_data_dir()
     if "MAXUB_PORT" not in os.environ:
         settings.port = pick_free_port()
     if "MAXUB_HOST" not in os.environ:
@@ -135,7 +137,11 @@ def main() -> int:
     try:
         settings.ensure_data_dir()
         configure_logging(settings)
-    except OSError as exc:
+    # `DataDirError` — объяснённый отказ каталога данных (нет прав, файл на
+    # месте каталога). Без него окно с ошибкой не показалось бы вовсе: у
+    # собранного без консоли exe трассировка уходит в никуда, и для пользователя
+    # это выглядит как «щёлкнул — ничего не произошло».
+    except (OSError, DataDirError) as exc:
         show_error(f"Не удалось подготовить каталог данных:\n{exc}")
         return 1
 

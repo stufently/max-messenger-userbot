@@ -25,7 +25,7 @@
 | Не является | ботом, официальным продуктом MAX, продуктом VK |
 | Язык и версия | Python 3.11, 3.12, 3.13, 3.14 |
 | Лицензия | MIT |
-| Способы запуска | `maxub.exe` для Windows, Docker, установка пакетом |
+| Способы запуска | `maxub.exe` для Windows, образ `ghcr.io/stufently/max-userbot`, `pipx` на Linux |
 | Способы входа | код из SMS на номер телефона, QR-код |
 | Интерфейсы | веб-панель, CLI `maxub`, машинный CLI `maxubctl`, HTTP API, WebSocket |
 | Мультиаккаунт | да, с первого дня |
@@ -115,7 +115,8 @@
 MAXUB_TRANSPORT=pymax   # в docker-compose.yml или в окружении
 ```
 
-При установке пакетом с PyPI её нужно попросить явно:
+При установке пакетом (колесом из релиза или, когда имя будет занято, с PyPI)
+библиотеку нужно попросить явно:
 
 ```bash
 pip install "max-userbot[pymax]"
@@ -175,16 +176,109 @@ SmartScreen. Собрать самому:
 bash packaging/windows/build.sh   # результат в dist/windows/
 ```
 
-## Быстрый старт в Docker
+## Linux: установка
+
+Отдельного бинарника под Linux нет, и это осознанно: колесо из релиза —
+`py3-none-any`, оно и есть линуксовый артефакт, а рядом лежит готовый образ.
+Собранный же одним файлом ELF был бы привязан к версии glibc сборочной машины и
+не запустился бы на системах старше неё — цена такой хрупкости выше пользы там,
+где есть `pipx` и Docker.
+
+Проще всего — `pipx`: программа встаёт в свой изолированный venv, а команды
+появляются в `~/.local/bin`. Номер версии в ссылках ниже — из релиза, который был
+последним на момент правки этого текста; актуальный список всегда на странице
+[релизов](https://github.com/stufently/max-messenger-userbot/releases/latest).
+
+```bash
+pipx install "max-userbot[pymax] @ https://github.com/stufently/max-messenger-userbot/releases/download/v0.2.0/max_userbot-0.2.0-py3-none-any.whl"
+maxub daemon
+```
+
+Без `pipx` — обычный venv:
+
+```bash
+python3 -m venv ~/.local/share/maxub-venv
+~/.local/share/maxub-venv/bin/pip install "max-userbot[pymax] @ https://github.com/stufently/max-messenger-userbot/releases/download/v0.2.0/max_userbot-0.2.0-py3-none-any.whl"
+~/.local/share/maxub-venv/bin/maxub daemon
+```
+
+Данные — токен API, БД с сессиями и ключ — лежат в `$XDG_DATA_HOME/maxub`, а если
+переменная не задана, в `~/.local/share/maxub`. Каталог создаётся с правами
+`0700`. Сменить его — `MAXUB_DATA_DIR`.
+
+Чтобы ключ шифрования сессий жил не в файле рядом с базой, а в хранилище ОС
+(GNOME Keyring, KWallet), нужен дополнительный набор: установите
+`max-userbot[pymax,keyring]`. Подробности — в «Хранение секретов».
+
+Автозапуск — пользовательским юнитом systemd, готовый лежит в
+[packaging/linux/maxub.service](packaging/linux/maxub.service):
+
+```bash
+mkdir -p ~/.local/share/maxub ~/.config/systemd/user
+cp packaging/linux/maxub.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now maxub
+loginctl enable-linger "$USER"   # работать и без входа в сеанс
+```
+
+Юнит именно пользовательский: демон держит сессии личного аккаунта, под root ему
+делать нечего, а хранилище ключей ОС живёт в сеансе пользователя и системному
+юниту недоступно.
+
+## Docker: готовый образ
+
+```bash
+docker run -d --name maxub \
+  -v maxub-data:/data \
+  -e MAXUB_TRANSPORT=stub \
+  ghcr.io/stufently/max-userbot:0.2.0
+
+docker exec maxub maxub accounts list
+```
+
+Образ работает от непривилегированного пользователя (UID 10001) и хранит данные
+в `/data`. Порт наружу не публикуется — демон управляет живыми аккаунтами, и
+доступ к нему только через `docker exec`.
+
+Про том. `maxub-data` — named volume, права на него Docker выставляет сам. Если
+данные нужны в своём каталоге на хосте, добавляется `--user`, иначе владелец
+каталога и пользователь внутри контейнера не совпадут:
+
+```bash
+mkdir -p ~/.local/share/maxub          # иначе каталог создаст Docker, и от root
+docker run -d --name maxub \
+  --user "$(id -u):$(id -g)" \
+  -v "$HOME/.local/share/maxub:/data" \
+  ghcr.io/stufently/max-userbot:0.2.0
+```
+
+Теги: точная версия (`0.2.0`) публикуется один раз и больше не переставляется,
+минорная (`0.2`) получает исправления внутри себя, `latest` — просто последнее.
+Держите живые аккаунты на точной версии: плавающий тег однажды приедет с
+изменённым поведением в неподходящий момент. Предвыпуски (`0.3.0rc1`) выкладываются
+только под своей точной версией и `latest` за собой не уводят.
+
+Веб-панель наружу не выставляется. Чтобы открыть её со своей машины, пробросьте
+порт на петлю хоста (`-p 127.0.0.1:8765:8765`), задайте `MAXUB_HOST=0.0.0.0` —
+иначе проброс упрётся в петлю внутри контейнера — и, если хост не локальный,
+ходите туннелем: `ssh -L 8765:127.0.0.1:8765 <хост>`. Цена решения описана в
+`docker-compose.yml`: демон становится виден и соседям по сети Docker, защищает
+его только токен.
+
+## Быстрый старт в Docker из исходников
+
+Сборка своего образа вместо готового — тот же Dockerfile, что и в релизе:
 
 ```bash
 docker compose up -d --build
 docker compose exec userbot maxub accounts list
 ```
 
-Порт наружу не публикуется: корневой токен даёт полный контроль над аккаунтами,
-поэтому доступ к API — только внутри контейнера. Тому, кому нужна часть, выдаётся
-токен с нужными областями — см. «Токены и права доступа».
+Данные лежат в томе `maxub-data`, а не в каталоге репозитория: права на том не
+зависят от того, какой у вас UID на этой машине. Удаляется он вместе с данными —
+`docker compose down -v`. Кому нужен именно каталог рядом с кодом, тот
+раскомментирует в `docker-compose.yml` bind-mount и строку `user:` — иначе
+владелец каталога и пользователь внутри контейнера не совпадут.
 
 Полный путь от добавления аккаунта до отправки сообщения:
 
@@ -358,10 +452,13 @@ docker compose exec userbot maxub tokens revoke --id 3
 
 ## Требования
 
-- Python 3.11 или новее — либо Docker, либо готовый `maxub.exe` под Windows.
+- Что-то одно из трёх: Python 3.11 или новее (Linux, macOS — `pipx`), Docker
+  (любая система) или готовый `maxub.exe` под Windows 11.
 - Аккаунт MAX с доступом к номеру телефона (для входа по коду) или к приложению
   на телефоне (для входа по QR).
 - Для Docker: возможность запускать контейнеры от своего пользователя.
+- Для хранилища ключей ОС на Linux: сеанс с GNOME Keyring или KWallet и набор
+  `max-userbot[keyring]`. Без него ключ шифрования просто останется в файле.
 
 ## Хранение секретов
 
