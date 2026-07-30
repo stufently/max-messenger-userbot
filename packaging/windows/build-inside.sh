@@ -12,6 +12,7 @@ DIST_DIR="${MAXUB_DIST_DIR:-/repo/dist/windows}"
 WORK_DIR="${TMPDIR:-/tmp}/maxub-pyinstaller"
 SPEC="/repo/packaging/windows/maxub.spec"
 CHECK="/repo/packaging/windows/check_bundle.py"
+SMOKE="/repo/packaging/windows/smoke_run.sh"
 
 mkdir -p "$DIST_DIR" "$WORK_DIR"
 
@@ -36,6 +37,15 @@ wineserver -w
 wine "$WINEPYTHON" "$(winepath -w "$CHECK")" \
     "$(winepath -w "$DIST_DIR/maxub.exe")" \
     "$(winepath -w "$DIST_DIR/maxubctl.exe")" 2>&1
+wineserver -w
+
+# Запуск собранного exe, а не только разбор его содержимого. Тот же скрипт зовёт
+# CI — расхождение между локальной сборкой и релизной эта сборка и призвана
+# исключать; что проверяется, написано в нём самом.
+#
+# Только консольный `maxubctl.exe`: `maxub.exe` собран без консоли и без
+# аргументов — он поднял бы демон и остался жить.
+bash "$SMOKE" xvfb-run -a wine "$(winepath -w "$DIST_DIR/maxubctl.exe")"
 wineserver -w
 
 ls -l "$DIST_DIR"
