@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import secrets
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Literal
 
 from pydantic import Field
@@ -16,17 +18,24 @@ from maxub.core.crypto import generate_key
 from maxub.core.keystore_backends import open_keystore
 from maxub.paths import DataDirError, default_data_dir
 
-#: Сколько раз пытаться создать файл секрета, уступая соседнему процессу.
-#: Больше двух витков подряд означает, что дело не в гонке, а в неисправности.
-SECRET_CREATE_ATTEMPTS = 3
+#: Сколько всего ждать значение, которое пишет сосед, выигравший гонку за файл.
+#: Счётчик витков тут не работает: между созданием файла и записью в него есть
+#: окно, и проигравший, крутясь без паузы, лишь отбирает у победителя то самое
+#: процессорное время, которого тому не хватает. Так и падал CI на двухъядерном
+#: раннере при четырёх потоках, тогда как на машине с запасом ядер окно
+#: закрывалось раньше, чем счётчик кончался.
+SECRET_WAIT_SECONDS = 5.0
+#: Первая пауза перед перечитыванием; дальше удваивается до `SECRET_WAIT_MAX`.
+SECRET_WAIT_STEP_SECONDS = 0.005
+SECRET_WAIT_MAX_SECONDS = 0.2
 
 TOKEN_FILE = "api_token"
 KEY_FILE = "secret.key"
 DB_FILE = "maxub.db"
 
 
-def _write_secret_file(path: Path, content: str) -> None:
-    """Создаёт файл сразу с правами 0600.
+def _create_new_file(path: Path, data: bytes) -> None:
+    """Создаёт новый файл сразу с правами 0600 и записывает его целиком.
 
     Вариант «записать, потом chmod» оставляет окно, в котором файл доступен по
     umask, — для секретов это неприемлемо.
@@ -35,13 +44,63 @@ def _write_secret_file(path: Path, content: str) -> None:
     такого флага нет вовсе: обращение к нему через ``getattr`` — не небрежность,
     а единственный способ не уронить импорт там, где защищать нечего (права в
     каталоге профиля определяет ACL).
+
+    Запись идёт циклом: `os.write` вправе записать не всё за раз, а «не всё» для
+    секрета — это обрезанный токен или нечитаемый ключ.
     """
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow, 0o600)
     try:
-        os.write(fd, content.encode("utf-8"))
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
     finally:
         os.close(fd)
+
+
+def _write_secret_file(path: Path, content: str) -> None:
+    """Публикует секрет под своим именем целиком или не публикует вовсе.
+
+    Создать файл и записать его — две операции, и между ними файл существует
+    пустым. Соседний процесс, стартовавший одновременно, в это окно видит уже
+    занятое имя и пустое содержимое: раньше он на этом падал, теперь ждёт, но
+    ждать ему было бы нечего, если публиковать сразу готовое. Поэтому запись
+    идёт во временный файл, а имя появляется одним `os.link` — он атомарен и, в
+    отличие от `os.replace`, не затирает чужую работу: занятое имя даёт
+    `FileExistsError`, то есть ровно тот ответ «победил сосед», на который
+    рассчитывает вызывающий.
+
+    Файловые системы без жёстких ссылок (FAT на съёмном диске, часть сетевых
+    томов) остаются с прежним поведением: там публикуется напрямую, узкое окно
+    лучше отказа запуститься.
+    """
+    data = content.encode("utf-8")
+    # Имя временного файла уникально для процесса: общее имя два процесса писали
+    # бы одновременно, и опубликовалась бы смесь.
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        _create_new_file(tmp, data)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise
+        except OSError:
+            _create_new_file(path, data)
+    finally:
+        with suppress(OSError):
+            tmp.unlink()
+
+
+def _read_secret_file(path: Path) -> str:
+    """Отдаёт записанный секрет или пустую строку, если его ещё нет.
+
+    Пустая строка — это и «файла нет», и «файл создан, но ещё не заполнен»:
+    оба случая означают одно — значения пока нет, надо подождать соседа.
+    """
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
 
 
 def _create_or_read_secret(path: Path, factory: Callable[[], str]) -> str:
@@ -51,22 +110,51 @@ def _create_or_read_secret(path: Path, factory: Callable[[], str]) -> str:
     файла нет. `O_EXCL` не даёт им затереть работу друг друга, но проигравший
     получал `FileExistsError` и падал ещё до запуска. Проигравшему нужен не
     отказ, а значение победителя — оно уже на диске.
+
+    Ждать приходится с паузой и по часам, а не отсчитывая витки: файл появляется
+    раньше своего содержимого, и это окно закрывает победитель, которому нужен
+    процессор. Уступать ему — единственный способ дождаться.
     """
-    for _ in range(SECRET_CREATE_ATTEMPTS):
-        if path.exists():
-            existing = path.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        value = factory()
+    deadline = monotonic() + SECRET_WAIT_SECONDS
+    delay = SECRET_WAIT_STEP_SECONDS
+    # Значение рождается лениво и один раз: когда файл уже есть, генерировать
+    # нечего вовсе, а новый секрет на каждом витке — выброшенная работа, для
+    # ключа шифрования заметная.
+    value: str | None = None
+    while True:
+        existing = _read_secret_file(path)
+        if existing:
+            return existing
+        if value is None:
+            value = factory()
         try:
             _write_secret_file(path, value)
         except FileExistsError:
-            # Файл создал соседний процесс между проверкой и записью — читаем
-            # его на следующем витке. Пустой файл (успели создать, но ещё не
-            # записали) тоже разрешается повтором.
-            continue
-        return value
-    raise RuntimeError(f"не удалось создать файл секрета: {path}")
+            # Файл создал сосед между чтением и записью. Значение придёт в него
+            # чуть позже — перечитаем после паузы.
+            pass
+        else:
+            return value
+        if monotonic() >= deadline:
+            # Последнее чтение уже за сроком: значение могло появиться в тот же
+            # миг, и отказывать, имея его на диске, — ложное падение.
+            existing = _read_secret_file(path)
+            if existing:
+                return existing
+            # Единственный оставшийся случай — пустой файл, который никто не
+            # заполняет: например, процесс упал между созданием и записью.
+            # Сам такой файл не удаляется: под ним может быть чужой каталог
+            # данных, а секреты чужими руками не трогают.
+            raise RuntimeError(
+                f"файл секрета {path} существует, но пуст и не заполняется."
+                " Похоже, запуск, который его создал, не дожил до записи;"
+                " пустой файл можно удалить. Если это secret.key и в каталоге"
+                " уже есть база с сессиями — сначала убедитесь, что ключ есть в"
+                " хранилище ОС или в копии: новый ключ сделает прежние сессии"
+                " нечитаемыми"
+            )
+        sleep(delay)
+        delay = min(delay * 2, SECRET_WAIT_MAX_SECONDS)
 
 
 class Settings(BaseSettings):

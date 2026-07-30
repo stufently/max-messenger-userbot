@@ -8,15 +8,18 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from maxub import winhost, winlauncher
+from maxub import config, winhost, winlauncher
 from maxub.config import Settings
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -221,6 +224,99 @@ def test_concurrent_first_start_shares_one_token(tmp_path: Path) -> None:
         assert len(results) == 4
         assert len(set(results)) == 1, "процессы разошлись в значении токена"
         assert results[0] == (data_dir / "api_token").read_text(encoding="utf-8").strip()
+
+
+def test_empty_token_file_is_awaited_not_refused(tmp_path: Path) -> None:
+    """Файл появляется раньше содержимого — это окно надо переждать.
+
+    Тот же случай, что в тесте выше, но без гонки: пустой файл здесь заполняется
+    заведомо позже, чем проигравший его прочитает. Прежний код отсчитывал три
+    витка без единой паузы и на этом сдавался — а на двухъядерном раннере GitHub
+    победитель именно в это окно и не успевал, из-за чего прогон падал
+    вероятностно, на случайной версии Python.
+    """
+    settings = Settings(data_dir=tmp_path, transport="stub")
+    token_path = tmp_path / "api_token"
+    token_path.touch(mode=0o600)
+
+    def fill_later() -> None:
+        time.sleep(0.1)
+        token_path.write_text("токен-победителя", encoding="utf-8")
+
+    writer = threading.Thread(target=fill_later)
+    writer.start()
+    try:
+        assert settings.resolve_token() == "токен-победителя"
+    finally:
+        writer.join(timeout=5)
+
+
+def test_secret_appears_under_its_name_already_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Имя файла секрета появляется, когда значение уже записано целиком.
+
+    Ожидание пустого файла (тест выше) — страховка, а не решение: пока имя
+    занимает пустой файл, сосед может прочитать и обрезанное значение, если
+    запись разошлась на части. Поэтому запись идёт во временный файл, а имя
+    появляется одним `os.link`. Проверяется ровно этот порядок: на момент
+    публикации целевого имени ещё нет, а в источнике — всё значение.
+    """
+    settings = Settings(data_dir=tmp_path, transport="stub")
+    token_path = tmp_path / "api_token"
+    real_link = os.link
+    observed: list[tuple[bool, str]] = []
+
+    def watching_link(src: object, dst: object) -> None:
+        observed.append((token_path.exists(), Path(str(src)).read_text(encoding="utf-8")))
+        real_link(str(src), str(dst))
+
+    monkeypatch.setattr(os, "link", watching_link)
+    token = settings.resolve_token()
+
+    assert observed, "публикация прошла мимо os.link"
+    taken, staged = observed[0]
+    assert not taken, "имя было занято ещё до публикации"
+    assert staged == token, "во временном файле лежало не всё значение"
+    assert not list(tmp_path.glob("api_token.tmp-*")), "временный файл не убран"
+
+
+def test_secret_survives_filesystem_without_hard_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """На ФС без жёстких ссылок запуск не отказывает, а пишет напрямую.
+
+    FAT на съёмном диске и часть сетевых томов `os.link` не поддерживают. Отказ
+    завести токен там был бы хуже, чем прежнее узкое окно между созданием файла
+    и записью в него.
+    """
+
+    def refuse_link(src: object, dst: object) -> None:
+        raise OSError(errno.EPERM, "жёсткие ссылки не поддерживаются")
+
+    monkeypatch.setattr(os, "link", refuse_link)
+    settings = Settings(data_dir=tmp_path, transport="stub")
+    token = settings.resolve_token()
+    token_path = tmp_path / "api_token"
+
+    assert token == token_path.read_text(encoding="utf-8").strip()
+    assert token_path.stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob("api_token.tmp-*")), "временный файл не убран"
+
+
+def test_token_file_that_stays_empty_is_explained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пустой файл, который никто не заполняет, — отказ со словами, но не сразу.
+
+    Ожидание укорочено намеренно: смысл проверки в том, что ожидание конечно, а
+    не в том, сколько оно длится по умолчанию.
+    """
+    monkeypatch.setattr(config, "SECRET_WAIT_SECONDS", 0.05)
+    settings = Settings(data_dir=tmp_path, transport="stub")
+    (tmp_path / "api_token").touch(mode=0o600)
+    with pytest.raises(RuntimeError, match="пуст"):
+        settings.resolve_token()
 
 
 def _resolve_token_in_parallel(
