@@ -112,7 +112,28 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install ".[dev]"
 
       - name: pytest
-        run: python -m pytest -q
+        # Вывод дублируется в файл: следующий шаг достаёт из него текст падения
+        # и кладёт в аннотацию, потому что сами логи прогона читаются только
+        # администратором репозитория — подробности в скрипте.
+        # `-o pipefail` обязателен: без него код возврата дал бы `tee`, и
+        # красный pytest выглядел бы зелёным шагом. Код сохраняется в файл, а не
+        # выводится: отчёт привязан именно к нему, чтобы аварийные исходы
+        # (сборка не собралась, интерпретатор упал, тесты не собрались) тоже
+        # попадали в аннотацию.
+        run: |
+          set -o pipefail
+          status=0
+          python -m pytest -q -rf --tb=short --color=no 2>&1 \
+            | tee "${RUNNER_TEMP}/pytest.log" || status=$?
+          printf '%s\n' "$status" >"${RUNNER_TEMP}/pytest.status"
+          exit "$status"
+
+      - name: Падения тестов — в аннотацию и сводку
+        if: failure()
+        run: |
+          bash .github/scripts/report-pytest-failures.sh \
+            "Тесты (py${{ matrix.python-version }})" \
+            "${RUNNER_TEMP}/pytest.log" "${RUNNER_TEMP}/pytest.status"
 
   docker:
     name: Образ и тесты внутри него
@@ -140,12 +161,17 @@ jobs:
         # `-p no:cacheprovider` — чтобы pytest не пытался писать .pytest_cache
         # в примонтированный только для чтения каталог.
         run: |
+          set -o pipefail
+          status=0
           docker run --rm \
             -v "$PWD/tests:/app/tests:ro" \
             -w /app \
             -e MAXUB_DATA_DIR=/tmp/data \
             max-userbot:ci \
-            python -m pytest -q -p no:cacheprovider
+            python -m pytest -q -rf --tb=short --color=no -p no:cacheprovider 2>&1 \
+            | tee "${RUNNER_TEMP}/pytest-image.log" || status=$?
+          printf '%s\n' "$status" >"${RUNNER_TEMP}/pytest-image.status"
+          exit "$status"
 
       - name: Check the real transport is inside the image
         # Тесты этого не поймают: они подменяют библиотеку транспорта фейком,
@@ -192,6 +218,17 @@ jobs:
               sys.exit(f"в публикуемом образе лишнее из dev: {', '.join(extra)}")
           print("состав публикуемого образа верный")
           PY
+
+      # В конце job-а, а не сразу после тестов: шаг с `if: failure()` в середине
+      # выполнился бы только при падении именно предыдущих шагов, а падения
+      # тестов надо показать при любом порядке отказов. Скрипт сам молчит, если
+      # тесты прошли, а упало что-то после них.
+      - name: Падения тестов в образе — в аннотацию и сводку
+        if: failure()
+        run: |
+          bash .github/scripts/report-pytest-failures.sh \
+            "Тесты в образе" \
+            "${RUNNER_TEMP}/pytest-image.log" "${RUNNER_TEMP}/pytest-image.status"
 
   versions:
     name: Версии Python согласованы
