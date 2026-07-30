@@ -77,7 +77,11 @@ def load_script(
 def test_complete_bundle_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     script = load_script(
         monkeypatch,
-        archive={PYZ_NAME: None, "python313.dll": None},
+        # Вторая запись — любая не-`.pyz`, чтобы проверка выбирала нужную, а не
+        # единственную. Имя без номера версии Python намеренно: иначе фикстуру
+        # пришлось бы править при каждом обновлении интерпретатора, а к тому,
+        # что она проверяет, версия отношения не имеет.
+        archive={PYZ_NAME: None, "vcruntime140.dll": None},
         bundled={"pymax", "pymax.client", "json"},
     )
     assert script.main(["maxub.exe"]) == 0
@@ -115,7 +119,7 @@ def test_archive_without_pyz_is_explained(monkeypatch: pytest.MonkeyPatch) -> No
     """Иначе вместо объяснения был бы `StopIteration` без единого слова."""
     script = load_script(
         monkeypatch,
-        archive={"python313.dll": None},
+        archive={"vcruntime140.dll": None},
         bundled={"pymax", "pymax.client"},
     )
     with pytest.raises(SystemExit) as exc:

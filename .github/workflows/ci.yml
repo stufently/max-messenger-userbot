@@ -43,7 +43,7 @@ concurrency:
 env:
   # Версия, на которой собирается рабочий образ, — она же основная для проверок,
   # которые не размножаются по матрице.
-  PRIMARY_PYTHON: "3.12"
+  PRIMARY_PYTHON: "3.14"
 
 jobs:
   static:
@@ -89,10 +89,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 — нижняя граница из `requires-python`, 3.12 — версия рабочего
-        # образа, 3.13 — версия, на которой собирается Windows-exe. Все три
-        # реально используются, поэтому все три проверяются.
-        python-version: ["3.11", "3.12", "3.13"]
+        # 3.11 — нижняя граница из `requires-python`, 3.14 — версия рабочего
+        # образа и релизного exe. Между ними 3.12 и 3.13: они больше нигде не
+        # закреплены, но объявленный контракт `>=3.11` обещает работу и на них,
+        # а необещанного здесь нет — версии ниже 3.11 не проверяются вовсе.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -105,9 +106,9 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install project with dev extras
-        # Без ограничений — намеренно, объяснение в шапке файла. Матрица из трёх
-        # версий Python и свободный выбор версий зависимостей — это и есть та
-        # проверка, которую закреплённый набор дать не может.
+        # Без ограничений — намеренно, объяснение в шапке файла. Матрица версий
+        # Python и свободный выбор версий зависимостей — это и есть та проверка,
+        # которую закреплённый набор дать не может.
         run: python -m pip install --upgrade pip && python -m pip install ".[dev]"
 
       - name: pytest
@@ -158,6 +159,100 @@ jobs:
             -e MAXUB_DATA_DIR=/tmp/data \
             max-userbot:ci \
             python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); print(t.name, t.capabilities.send_text)"
+
+  versions:
+    name: Версии Python согласованы
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Python versions agree across workflows and images
+        # Версия Python прошита в семи местах, и передать её между ними нечем:
+        # `env` одного workflow не виден другому, базовый образ закреплён по
+        # digest, `setup-python` требует литерал, а каталог установки под Wine —
+        # часть пути Windows. Значит, совпадение нужно сторожить: при обновлении
+        # до 3.14 два номера в release.yml так и остались на 3.12 и нашлись
+        # только на ревью, то есть случайно.
+        #
+        # Где сверяется точная версия, а где только минор — не единообразно, и
+        # это осознанно. Сборка exe под Wine и на раннере обязана идти одним
+        # интерпретатором, там сравнивается патч. У образа Docker патч выбирает
+        # тег (`3.14-slim` — это движущийся 3.14.x), и требовать там совпадения
+        # значило бы завести проверку, которую придётся отключить при первом же
+        # обновлении образа.
+        #
+        # `PRIMARY_PYTHON` берётся из env всего workflow — того же значения, что
+        # получают шаги `setup-python` выше.
+        run: |
+          set -euo pipefail
+          fail=0
+          bad() { echo "$1" >&2; fail=1; }
+          # Каждое значение вынимается по своей форме, а не «числом, похожим на
+          # версию»: иначе проверка нашла бы номер в соседнем комментарии и
+          # сравнивала бы текст сама с собой.
+          winfile=packaging/windows/Dockerfile
+          image_minor="$(sed -n 's/^# python:\([0-9]\+\.[0-9]\+\)-slim.*$/\1/p' Dockerfile)"
+          exe_version="$(sed -n 's/^ARG PYTHON_VERSION=\([0-9]\+\.[0-9]\+\.[0-9]\+\)$/\1/p' "$winfile")"
+          exe_dir="$(sed -n 's/^ARG PYTHON_DIR="C:\\\\Python\([0-9]\+\)"$/\1/p' "$winfile")"
+          runner_version="$(sed -n 's/^ *python-version: "\([0-9.]\+\)"$/\1/p' .github/workflows/windows-build.yml)"
+          mapfile -t release_versions < <(
+              sed -n 's/^ *python-version: "\([0-9.]\+\)"$/\1/p' .github/workflows/release.yml)
+          matrix="$(sed -n 's/^ *python-version: \(\[.*\]\)$/\1/p' .github/workflows/ci.yml)"
+
+          # Пустое значение значит, что форма в файле изменилась, — это отказ, а
+          # не «проверять нечего»: молчаливо переставшая проверять проверка хуже
+          # отсутствующей, её зелёному верят. Проверяется в основной оболочке, а
+          # не внутри подстановки: `fail=1`, выставленный в подоболочке, пропал бы.
+          require() {
+              [ -n "$2" ] || bad "не найдено: $1 — проверка перестала проверять"
+          }
+          require "тег базового образа (Dockerfile)" "$image_minor"
+          require "ARG PYTHON_VERSION ($winfile)" "$exe_version"
+          require "ARG PYTHON_DIR ($winfile)" "$exe_dir"
+          require "python-version (windows-build.yml)" "$runner_version"
+          require "матрица тестов (ci.yml)" "$matrix"
+
+          echo "основная версия: $PRIMARY_PYTHON"
+          echo "образ: $image_minor, exe: $exe_version (каталог Python$exe_dir," \
+               "раннер $runner_version), release.yml: ${release_versions[*]-нет}"
+          echo "матрица: $matrix"
+
+          [ "$image_minor" = "$PRIMARY_PYTHON" ] \
+              || bad "базовый образ: $image_minor, ожидалось $PRIMARY_PYTHON"
+          [ "${exe_version%.*}" = "$PRIMARY_PYTHON" ] \
+              || bad "интерпретатор exe: $exe_version, ожидался $PRIMARY_PYTHON.x"
+          # Патч, а не минор: windows-build.yml обещает, что exe с раннера и exe,
+          # собранный локально под Wine, — одна и та же сборка Python.
+          [ "$runner_version" = "$exe_version" ] \
+              || bad "раннер собирает exe на $runner_version, образ под Wine — на $exe_version"
+          # Каталог установки вычисляется из версии, а не сверяется со списком:
+          # так проверка не требует правки при следующем обновлении.
+          expected_dir="$(printf '%s' "${exe_version%.*}" | tr -d .)"
+          [ "$exe_dir" = "$expected_dir" ] \
+              || bad "каталог C:\\Python$exe_dir не соответствует версии $exe_version"
+
+          # Число вхождений, а потом значения: `sort -u` сам по себе пропустил бы
+          # исчезновение одной из двух строк — оставшаяся совпала бы с ожиданием,
+          # и молчание проверки означало бы, что колесо собирается неизвестно чем.
+          if [ "${#release_versions[@]}" -ne 2 ]; then
+              bad "в release.yml ожидались ровно два python-version (проверка тега и сборка колеса), найдено ${#release_versions[@]}"
+          fi
+          for version in ${release_versions[@]+"${release_versions[@]}"}; do
+              [ "$version" = "$PRIMARY_PYTHON" ] \
+                  || bad "release.yml: $version, ожидалось $PRIMARY_PYTHON"
+          done
+
+          # Матрица не сравнивается с основной версией — она нарочно шире, — но
+          # основная версия обязана в ней быть: иначе то, на чём собираются
+          # артефакты, тестами не покрыто.
+          printf '%s' "$matrix" | grep -Fq "\"$PRIMARY_PYTHON\"" \
+              || bad "в матрице тестов нет основной версии $PRIMARY_PYTHON"
+
+          if [ "$fail" -eq 0 ]; then
+              echo "версии согласованы"
+          fi
+          exit "$fail"
 
   winbuild-base:
     name: Сборочный образ Windows согласован

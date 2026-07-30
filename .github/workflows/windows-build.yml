@@ -70,7 +70,7 @@ jobs:
         with:
           # Та же версия, что зафиксирована в packaging/windows/Dockerfile:
           # сборки под Wine и на раннере должны совпадать по интерпретатору.
-          python-version: "3.13.14"
+          python-version: "3.14.6"
 
       - name: Install project and build tools
         # Версии закреплены файлом ограничений: это релизный артефакт, и его
