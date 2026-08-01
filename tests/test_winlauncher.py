@@ -21,6 +21,7 @@ import pytest
 
 from maxub import config, winhost, winlauncher
 from maxub.config import Settings
+from maxub.paths import DataDirError
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -311,12 +312,17 @@ def test_token_file_that_stays_empty_is_explained(
 
     Ожидание укорочено намеренно: смысл проверки в том, что ожидание конечно, а
     не в том, сколько оно длится по умолчанию.
+
+    Тип проверяется точно, а не как любой `RuntimeError`: на голом типе отказ
+    пролетал мимо всех обработчиков — CLI печатал трассировку поверх аккуратно
+    написанного текста, exe без консоли умирал молча.
     """
     monkeypatch.setattr(config, "SECRET_WAIT_SECONDS", 0.05)
     settings = Settings(data_dir=tmp_path, transport="stub")
     (tmp_path / "api_token").touch(mode=0o600)
-    with pytest.raises(RuntimeError, match="пуст"):
+    with pytest.raises(config.SecretError, match="пуст"):
         settings.resolve_token()
+    assert issubclass(config.SecretError, DataDirError)
 
 
 def _resolve_token_in_parallel(
@@ -365,3 +371,66 @@ def test_broken_data_dir_shows_a_window(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert winlauncher.main() == 1
     assert len(shown) == 1
     assert "MAXUB_DATA_DIR" in shown[0]
+
+
+@pytest.fixture
+def launcher_probe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[list[str], list[str]]:
+    """Каталог с застрявшим пустым токеном; окна и открытые адреса — в списки."""
+    monkeypatch.setattr(config, "SECRET_WAIT_SECONDS", 0.05)
+    monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MAXUB_TRANSPORT", "stub")
+    (tmp_path / "api_token").touch(mode=0o600)
+
+    shown: list[str] = []
+    opened: list[str] = []
+    monkeypatch.setattr(winlauncher, "show_error", lambda message: shown.append(message))
+    monkeypatch.setattr(winlauncher.webbrowser, "open", lambda url: opened.append(url))
+    # Демон в тесте поднимать нечем и незачем: до него дойти не должны, а если
+    # дойдут — пусть это будет видно как ошибка, а не как повисший тест.
+    monkeypatch.setattr(
+        winlauncher, "serve", lambda settings: pytest.fail("демон не должен запускаться")
+    )
+    return shown, opened
+
+
+def test_stuck_token_shows_a_window_on_first_start(
+    launcher_probe: tuple[list[str], list[str]], tmp_path: Path
+) -> None:
+    """Первый запуск с застрявшим файлом токена: окно, код 1, запись в журнал.
+
+    Раньше здесь ловился только `OSError`, и отказ секрета улетал наружу мимо
+    окна: у exe без консоли это выглядит как «щёлкнул — ничего не произошло»,
+    причём и в `launcher.log` не оставалось ни строки.
+
+    Журнал проверяется файлом, а не `caplog`: лаунчер настраивает логирование
+    сам с `force=True`, снимая чужие обработчики, — и файл как раз то место,
+    куда пользователя отправляет окно с ошибкой.
+    """
+    shown, opened = launcher_probe
+    assert winlauncher.main() == 1
+    assert len(shown) == 1
+    assert "токен" in shown[0].lower()
+    assert not opened, "браузер открывать нечем: токена нет"
+
+    journal = (tmp_path / "launcher.log").read_text(encoding="utf-8")
+    assert "не удалось подготовить токен доступа" in journal
+    assert "SecretError" in journal, "в журнале нужна трассировка, а не только строка"
+
+
+def test_stuck_token_shows_a_window_when_daemon_already_runs(
+    launcher_probe: tuple[list[str], list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Та же ветка, но демон уже работает: окно вместо падения по дороге к панели.
+
+    Ветвь отдельная, потому что и падала она отдельно: там `resolve_token`
+    стоял вообще без обработчика.
+    """
+    shown, opened = launcher_probe
+    monkeypatch.setattr(
+        winlauncher, "running_instance", lambda data_dir, path: "http://127.0.0.1:8765"
+    )
+
+    assert winlauncher.main() == 1
+    assert len(shown) == 1
+    assert "токен" in shown[0].lower()
+    assert not opened, "панель без токена открывать некуда"

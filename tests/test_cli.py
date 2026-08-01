@@ -18,6 +18,7 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
+from maxub import config
 from maxub.api.app import create_app
 from maxub.cli import client as client_module
 from maxub.cli import errors as cli_errors
@@ -295,6 +296,25 @@ def test_usage_errors_exit_two(
 def test_help_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
     assert _run_cli(["--help"]) == client_module.EXIT_OK
+
+
+def test_stuck_secret_file_is_explained_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Застрявший пустой файл секрета — текст словами и код 1, а не трассировка.
+
+    Отказ писался развёрнуто и по делу, но летел голым `RuntimeError` мимо всех
+    обработчиков: Rich печатал поверх него полотно трассировки, и объяснение
+    оказывалось в самом низу, где его никто не читает.
+    """
+    monkeypatch.setattr(config, "SECRET_WAIT_SECONDS", 0.05)
+    monkeypatch.setenv("MAXUB_DATA_DIR", str(tmp_path))
+    (tmp_path / "api_token").touch(mode=0o600)
+
+    assert _run_cli(["token"]) == client_module.EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "пуст" in captured.err
+    assert "Traceback" not in captured.err and "RuntimeError" not in captured.err
 
 
 def test_vendored_click_exceptions_are_covered() -> None:

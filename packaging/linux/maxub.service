@@ -18,8 +18,11 @@
 [Unit]
 Description=MAX Userbot — автоматизация пользовательских аккаунтов MAX
 Documentation=https://github.com/stufently/max-messenger-userbot
-After=network-online.target
-Wants=network-online.target
+
+; Ожидания сети здесь нет намеренно. `network-online.target` — юнит системного
+; менеджера, у пользовательского своё пространство имён и такого юнита в нём нет
+; вовсе: `Wants=` на него повисает, `After=` не упорядочивает ничего. Ждать сеть
+; демону и не нужно — см. Restart ниже.
 
 [Service]
 Type=simple
@@ -42,7 +45,8 @@ Restart=on-failure
 RestartSec=5
 
 ; Демон переживает разрыв сети сам (надзор за соединением и переподключение —
-; в core/supervisor.py), поэтому Restart нужен только на настоящие падения.
+; в core/supervisor.py), поэтому Restart нужен только на настоящие падения — и
+; поэтому же старт до появления сети ничем ему не грозит.
 
 NoNewPrivileges=true
 PrivateTmp=true

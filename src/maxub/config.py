@@ -34,6 +34,22 @@ KEY_FILE = "secret.key"
 DB_FILE = "maxub.db"
 
 
+class SecretError(DataDirError):
+    """Секрет не получить: файл пуст, хранилище ОС молчит, ключ потерян.
+
+    Наследуется от `DataDirError` не ради родства смыслов, а ради поведения:
+    это такой же объяснённый словами отказ на старте, и три входа обязаны
+    показать его одинаково — CLI сообщением вместо трассировки, exe окном
+    (собранному без консоли выводиться некуда), демон текстом в журнале.
+    Обработчики этого типа уже стоят, поэтому подкласс подхватывается ими сам;
+    независимый тип пришлось бы дописывать в каждый `except` — и однажды
+    какой-нибудь вход снова забыли бы.
+
+    Определён здесь, а не рядом с `DataDirError`: `paths.py` намеренно знает
+    только про расположение каталога, а секреты — забота конфигурации.
+    """
+
+
 def _create_new_file(path: Path, data: bytes) -> None:
     """Создаёт новый файл сразу с правами 0600 и записывает его целиком.
 
@@ -145,7 +161,7 @@ def _create_or_read_secret(path: Path, factory: Callable[[], str]) -> str:
             # заполняет: например, процесс упал между созданием и записью.
             # Сам такой файл не удаляется: под ним может быть чужой каталог
             # данных, а секреты чужими руками не трогают.
-            raise RuntimeError(
+            raise SecretError(
                 f"файл секрета {path} существует, но пуст и не заполняется."
                 " Похоже, запуск, который его создал, не дожил до записи;"
                 " пустой файл можно удалить. Если это secret.key и в каталоге"
@@ -328,7 +344,7 @@ class Settings(BaseSettings):
             if self.secret_key_store == "os":
                 # Режим выбран явно: тихо съехать на файл — значит дать не ту
                 # защиту, о которой попросили.
-                raise RuntimeError(
+                raise SecretError(
                     "MAXUB_SECRET_KEY_STORE=os, но хранилище ключей ОС ответило отказом"
                 )
         self._refuse_blind_new_key(store_failed=store is not None)
@@ -340,7 +356,7 @@ class Settings(BaseSettings):
             return None
         store = open_keystore(self.data_dir)
         if store is None and self.secret_key_store == "os":
-            raise RuntimeError(
+            raise SecretError(
                 "MAXUB_SECRET_KEY_STORE=os, но хранилища ключей ОС нет:"
                 " в Linux нужен запущенный Secret Service и установленный keyring"
             )
@@ -364,14 +380,14 @@ class Settings(BaseSettings):
             return
         marker = keystore.moved_marker(self.secret_key_path)
         if marker.exists():
-            raise RuntimeError(
+            raise SecretError(
                 "ключ шифрования перенесён в хранилище ОС, а получить его оттуда"
                 " сейчас не удаётся: новый ключ сделал бы сессии нечитаемыми."
                 " Восстановите доступ к хранилищу, задайте MAXUB_SECRET_KEY или"
                 f" удалите {marker}, если сессии больше не нужны"
             )
         if store_failed and self.db_path.exists():
-            raise RuntimeError(
+            raise SecretError(
                 "хранилище ключей ОС недоступно, а файла secret.key нет,"
                 " хотя база уже существует: новый ключ сделал бы сессии"
                 " нечитаемыми. Задайте MAXUB_SECRET_KEY или восстановите файл"

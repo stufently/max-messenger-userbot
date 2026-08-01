@@ -184,7 +184,7 @@ jobs:
           docker run --rm \
             -e MAXUB_DATA_DIR=/tmp/data \
             max-userbot:ci \
-            python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); print(t.name, t.capabilities.send_text)"
+            python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); assert t.capabilities.send_text, 'адаптер собран без отправки текста'; print(t.name, t.capabilities.send_text)"
 
       # Публикуемый образ отличается от проверенного выше одним аргументом
       # (`EXTRAS=pymax` вместо `dev,pymax`), и этого достаточно, чтобы он повёл
@@ -205,8 +205,16 @@ jobs:
         # Иначе `EXTRAS` мог бы тихо перестать действовать (например, после
         # правки строки установки), и пользователи получали бы образ с pytest,
         # mypy и ruff внутри.
+        #
+        # `-i` обязателен: без него stdin контейнера закрыт, `python -` читает
+        # EOF и молча выходит с нулём — шаг был зелёным, ничего не проверив.
+        # Чтобы это не повторилось незаметно, мало починить флаг: проверка
+        # обязана предъявить доказательство работы. Вывод сверяется с маркером,
+        # и «скрипт не выполнился» отличается от «скрипт сказал, что всё в
+        # порядке».
         run: |
-          docker run --rm max-userbot:release python - <<'PY'
+          set -o pipefail
+          output="$(docker run --rm -i max-userbot:release python - <<'PY'
           import importlib.util as util
           import sys
 
@@ -218,6 +226,12 @@ jobs:
               sys.exit(f"в публикуемом образе лишнее из dev: {', '.join(extra)}")
           print("состав публикуемого образа верный")
           PY
+          )"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"состав публикуемого образа верный"*) ;;
+            *) echo "проверка состава не выполнилась: маркера в выводе нет"; exit 1 ;;
+          esac
 
       # В конце job-а, а не сразу после тестов: шаг с `if: failure()` в середине
       # выполнился бы только при падении именно предыдущих шагов, а падения

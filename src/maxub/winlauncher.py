@@ -131,6 +131,23 @@ def _open_panel(settings: Settings, base_url: str, token: str) -> None:
     webbrowser.open(panel_url(base_url, token))
 
 
+def _token_or_window(settings: Settings) -> str | None:
+    """Возвращает токен или `None`, показав окно и записав причину в журнал.
+
+    Общий помощник, а не два блока `try` подряд: токен нужен обеим ветвям —
+    и когда демон уже работает, и когда поднимается свой, — а разойтись им
+    нельзя. Ловится не только `OSError`: пустой файл секрета, недоступное
+    хранилище ключей ОС и потерянный ключ приходят как `SecretError`, и без
+    него exe без консоли умирал бы молча, не оставив следа даже в журнале.
+    """
+    try:
+        return settings.resolve_token()
+    except (OSError, DataDirError) as exc:
+        log.exception("не удалось подготовить токен доступа")
+        show_error(f"Не удалось подготовить токен доступа:\n{exc}")
+        return None
+
+
 def main() -> int:
     """Запускает демон и панель; возвращает код выхода процесса."""
     settings = build_settings()
@@ -148,7 +165,9 @@ def main() -> int:
     existing = running_instance(settings.data_dir, HEALTH_PATH)
     if existing:
         log.info("экземпляр уже работает на %s, открываю панель", existing)
-        token = settings.resolve_token()
+        token = _token_or_window(settings)
+        if token is None:
+            return 1
         webbrowser.open(panel_url(existing, token))
         return 0
     # Замок берётся до создания секретов: два первых запуска иначе оба увидели
@@ -160,10 +179,8 @@ def main() -> int:
         show_error("MAX Userbot уже запускается. Подождите несколько секунд.")
         return 0
 
-    try:
-        token = settings.resolve_token()
-    except OSError as exc:
-        show_error(f"Не удалось подготовить токен доступа:\n{exc}")
+    token = _token_or_window(settings)
+    if token is None:
         return 1
 
     base_url = f"http://{settings.host}:{settings.port}"
