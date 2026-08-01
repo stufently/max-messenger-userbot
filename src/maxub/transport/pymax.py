@@ -1,8 +1,11 @@
 """Транспорт поверх библиотеки PyMax (PyPI ``maxapi-python``, импорт ``pymax``).
 
-**Адаптер не проверен на живом аккаунте MAX.** Проверены только исходники
-библиотеки (2.3.1) и поведение на подставном модуле в тестах. С настоящим
-аккаунтом в первую очередь нужно проверить — в порядке убывания цены ошибки:
+**Адаптер не проверен на живом аккаунте MAX.** Проверены исходники библиотеки
+(2.3.1), поведение на подставном модуле и разговор по протоколу с локальным
+websocket-сервером (`tests/test_transport_ws.py`): handshake, вход по
+сохранённому токену, входящее событие, отправка и закрытие соединения идут через
+настоящий сокет. Чего это не заменяет — самого MAX. С настоящим аккаунтом в
+первую очередь нужно проверить, в порядке убывания цены ошибки:
 
 1. Раскладку отказов сервера ([pymax_errors][maxub.transport.pymax_errors]):
    коды ошибок MAX не документированы, маркеры лимитов и авторизации подобраны
@@ -92,10 +95,17 @@ class PyMaxTransport:
         qr_login=True,
     )
 
-    def __init__(self, *, proxy: str | None = None, request_timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        proxy: str | None = None,
+        request_timeout: float = 30.0,
+        endpoint: str | None = None,
+    ) -> None:
         self._pymax = load_pymax()
         self._proxy = proxy
         self._request_timeout = request_timeout
+        self._endpoint = endpoint
         self._runtime: ClientRuntime | None = None
         self._login = LoginFlows(self._pymax, self._launch, WORK_DIR)
 
@@ -267,6 +277,7 @@ class PyMaxTransport:
             request_timeout=self._request_timeout,
             envelope=envelope,
             device_id=device_id,
+            endpoint=self._endpoint,
         )
         runtime.launch(build(extra))
         self._runtime = runtime

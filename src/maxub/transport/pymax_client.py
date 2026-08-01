@@ -41,8 +41,16 @@ def build_extra_config(
     request_timeout: float,
     envelope: Envelope | None = None,
     device_id: str | None = None,
+    endpoint: str | None = None,
 ) -> Any:
-    """Собирает `ExtraConfig` и запоминает его в runtime."""
+    """Собирает `ExtraConfig` и запоминает его в runtime.
+
+    ``endpoint`` подменяет websocket-адрес MAX. Пустое значение означает «адрес
+    выбирает библиотека»: подставить сюда её же умолчание значило бы завести
+    вторую копию адреса, которая молча разойдётся с первой при обновлении
+    PyMax. Точка внутренняя, из настроек демона она пока не задаётся, — как и
+    соседние ``proxy`` с ``request_timeout``.
+    """
     extra = pymax.ExtraConfig(
         token=envelope.token if envelope else None,
         device_id=device_id,
@@ -59,6 +67,8 @@ def build_extra_config(
         # ядро, в одном месте и зашифрованными.
         store=runtime.store,
     )
+    if endpoint:
+        extra.url = endpoint
     if envelope is not None and envelope.mt_instance_id:
         extra.mt_instance_id = envelope.mt_instance_id
     extra.user_agent = _user_agent(extra, web=web, envelope=envelope)

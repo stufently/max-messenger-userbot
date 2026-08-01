@@ -66,7 +66,8 @@ src/maxub/
 packaging/windows/   сборка автономного exe: образ с Wine, спека PyInstaller
 packaging/constraints.txt  точные версии для сборки дистрибутива
 .github/workflows/   CI: проверки, сборка под Windows, релиз по тегу
-tests/               тесты ядра, API, доставки, QR, миграций, веб-панели и CLI
+tests/               тесты ядра, API, доставки, QR, миграций, веб-панели, CLI и
+                     транспорта — в том числе на настоящем websocket-сервере
 ```
 
 Направление зависимостей одностороннее: `api` и `cli` знают про `core`,

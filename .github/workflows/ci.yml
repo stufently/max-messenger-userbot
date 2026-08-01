@@ -135,6 +135,37 @@ jobs:
             "Тесты (py${{ matrix.python-version }})" \
             "${RUNNER_TEMP}/pytest.log" "${RUNNER_TEMP}/pytest.status"
 
+  transport:
+    name: Транспорт на свежих зависимостях
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PRIMARY_PYTHON }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with the transport extra
+        # Без ограничений и вместе с `pymax` — в этом весь смысл работы. Образ
+        # проверяет закреплённый набор, матрица выше — свободные версии, но без
+        # транспорта: она ставит `.[dev]` и тем доказывает, что без библиотеки
+        # платформа поднимается на заглушке. Ни та, ни другая не увидели бы, как
+        # свежий `websockets` ломает разговор с MAX, — а пользователь ставит
+        # пакет из PyPI именно так, без наших пинов.
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev,pymax]"
+
+      - name: Что именно установилось
+        # В журнал, чтобы по красному прогону было видно версию, а не только
+        # факт поломки: пины живут в packaging/constraints.txt и сюда не идут.
+        run: python -m pip show maxapi-python websockets | grep -E '^(Name|Version):'
+
+      - name: Транспорт проверен на настоящем сокете, а не пропущен
+        run: bash .github/scripts/transport-socket-gate.sh python -m pytest
+
   docker:
     name: Образ и тесты внутри него
     runs-on: ubuntu-latest
@@ -185,6 +216,25 @@ jobs:
             -e MAXUB_DATA_DIR=/tmp/data \
             max-userbot:ci \
             python -c "from maxub.transport import get_factory; t = get_factory('pymax')(); assert t.capabilities.send_text, 'адаптер собран без отправки текста'; print(t.name, t.capabilities.send_text)"
+
+      - name: Транспорт проверен на настоящем сокете, а не пропущен
+        # Предыдущий шаг с полным набором тестов этот файл уже прогнал, но там
+        # его пропуск был бы незаметен — почему, объяснено в самом скрипте.
+        # Здесь проверяется закреплённый набор из образа; свободные версии тех
+        # же зависимостей — в job «Транспорт на свежих зависимостях».
+        #
+        # `--network none` — не осторожность вообще, а защита от конкретной
+        # ошибки: при потерянном пробросе адреса клиент ушёл бы на настоящий
+        # `wss://ws-api.oneme.ru`. В самом тесте на это стоит своя страховка,
+        # здесь — вторая: тесту интернет не нужен, значит, его и не будет.
+        run: |
+          bash .github/scripts/transport-socket-gate.sh \
+            docker run --rm --network none \
+            -v "$PWD/tests:/app/tests:ro" \
+            -w /app \
+            -e MAXUB_DATA_DIR=/tmp/data \
+            max-userbot:ci \
+            python -m pytest
 
       # Публикуемый образ отличается от проверенного выше одним аргументом
       # (`EXTRAS=pymax` вместо `dev,pymax`), и этого достаточно, чтобы он повёл
