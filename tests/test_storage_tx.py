@@ -82,10 +82,16 @@ async def test_failed_event_rolls_back_sent_mark(
     stop = asyncio.Event()
 
     async def noisy_writer() -> None:
-        """Сосед, который всё это время активно пишет и фиксирует."""
+        """Сосед, который всё это время активно пишет и фиксирует.
+
+        Круг идёт через захват: отказ разрешён только записи, которой
+        распоряжается воркер, и без захвата сосед писал бы вхолостую — то есть
+        не создавал бы того самого потока фиксаций, ради которого он здесь.
+        """
         while not stop.is_set():
-            await storage.mark_failed(noise.id, "боль")
-            await storage.requeue(noise.id)
+            await storage.claim_queued()
+            assert await storage.mark_failed(noise.id, "боль")
+            assert await storage.requeue(noise.id)
 
     writer = asyncio.create_task(noisy_writer())
     try:
@@ -215,9 +221,20 @@ async def test_parallel_writes_are_not_lost(storage: Storage) -> None:
         )
         assert created
         await storage.record_event(_event(account_id, f"событие-{index}"))
-        await storage.mark_failed(item.id, f"ошибка-{index}")
 
     await asyncio.wait_for(asyncio.gather(*(one(index) for index in range(total))), TIMEOUT)
+
+    # Захват — единственная операция, которая выбирает записи сама, а отказ
+    # разрешён только захваченным. Поэтому пачка забирается разом, и дальше
+    # каждая корутина закрывает свою запись, а не чужую.
+    claimed = await storage.claim_queued(limit=total)
+    assert len(claimed) == total
+
+    async def close(item: OutboxItem) -> None:
+        index = item.idempotency_key.removeprefix("ключ-")
+        assert await storage.mark_failed(item.id, f"ошибка-{index}")
+
+    await asyncio.wait_for(asyncio.gather(*(close(item) for item in claimed)), TIMEOUT)
 
     stats = await storage.outbox_stats()
     assert stats[OutboxState.FAILED.value] == total

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 from collections.abc import Awaitable, Callable
@@ -53,6 +54,14 @@ class OutboxWorker:
         self._on_auth_lost = on_auth_lost
         self._reconciler = Reconciler(repo, get_transport, publish)
         self._stopping = asyncio.Event()
+        # С какого момента запись ждёт соединения. Возраст записи для этого не
+        # годится: он считает и время под лимитом, и простой демона, и тогда
+        # сообщение, честно прождавшее очереди час, умирало бы от секундного
+        # обрыва — с формулировкой про час без связи, которой не было. Здесь
+        # же лежит ровно ожидание связи и ничего больше. Память переживать
+        # перезапуск не обязана: после него отсчёт начинается заново, а
+        # ожидание всё равно ограничено временем работы демона.
+        self._offline_since: dict[int, datetime] = {}
 
     def stop(self) -> None:
         self._stopping.set()
@@ -78,14 +87,17 @@ class OutboxWorker:
             try:
                 items = await self._repo.claim_queued()
                 if not items:
-                    await asyncio.sleep(IDLE_SECONDS)
+                    await self._idle()
                     continue
                 for item in items:
                     if self._stopping.is_set():
                         # Остаток пачки транспорт не увидит: возвращаем его в
                         # очередь сразу, чтобы остановка не задерживала отправку
-                        # до следующего запуска.
-                        await self._repo.release_claimed(item.id)
+                        # до следующего запуска. Попытка при этом откатывается —
+                        # её засчитал захват, а отправки не было; иначе демон,
+                        # перезапущенный несколько раз подряд, хоронил бы
+                        # нетронутые сообщения по лимиту попыток.
+                        await self._repo.defer_claimed(item.id, utcnow())
                         continue
                     await self._process(item)
             except asyncio.CancelledError:
@@ -97,6 +109,15 @@ class OutboxWorker:
                 # остановила бы отправку целиком.
                 log.exception("сбой в цикле отправки")
                 await asyncio.sleep(IDLE_SECONDS)
+
+    async def _idle(self) -> None:
+        """Ждёт работы, но не проспит остановку.
+
+        Обычный сон досыпается до конца, и остановка на пустой очереди стоила
+        бы лишнего круга ожидания — ровно там, где выход должен быть мгновенным.
+        """
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stopping.wait(), timeout=IDLE_SECONDS)
 
     async def _process(self, item: OutboxItem) -> None:
         """Следит, чтобы захваченная запись не зависла из-за сбоя вне транспорта.
@@ -118,16 +139,17 @@ class OutboxWorker:
             # Сюда приводят только захваты, оборвавшиеся вместе с процессом:
             # обычный путь закрывает запись раньше, в _retry_or_fail. Без этой
             # проверки сообщение, роняющее демон, забирали бы вечно.
-            await self._repo.mark_failed(
-                item.id,
+            await self._fail(
+                item,
                 f"исчерпан лимит попыток ({self._settings.max_send_attempts}):"
                 " отправка обрывалась вместе с процессом",
             )
             return
         transport = self._get_transport(item.account_id)
         if transport is None:
-            await self._retry_or_fail(item, "нет активного соединения")
+            await self._wait_for_connection(item)
             return
+        self._offline_since.pop(item.id, None)
         # Долгое ожидание не высиживается на месте. Воркер один на все аккаунты,
         # и штраф сервера по одному из них — хоть на час — остановил бы отправку
         # у всех остальных, а захваченный остаток пачки провисел бы в claimed всё
@@ -167,7 +189,7 @@ class OutboxWorker:
             await self._retry_or_fail(item, str(exc))
             return
         except TransportAuthError as exc:
-            await self._repo.mark_failed(item.id, str(exc))
+            await self._fail(item, str(exc))
             await self._on_auth_lost(item.account_id, str(exc))
             return
         except TransportPermanent as exc:
@@ -175,7 +197,7 @@ class OutboxWorker:
             # сервер его не принял осознанно. Без этой ветки заведомо неверное
             # сообщение висело бы в sending до ручного разбора наравне с
             # действительно неоднозначными — и прятало бы их за собой.
-            await self._repo.mark_failed(item.id, str(exc))
+            await self._fail(item, str(exc))
             return
         except Exception as exc:
             # Таймаут, обрыв, TransportOutcomeUnknown: сообщение могло уйти.
@@ -188,6 +210,58 @@ class OutboxWorker:
         event = sent_event(item, remote_id)
         if await self._repo.mark_sent_with_event(item.id, remote_id, event):
             self._publish(event)
+
+    async def _wait_for_connection(self, item: OutboxItem) -> None:
+        """Отправляет запись обратно в очередь, пока соединение не вернётся.
+
+        Попытка здесь не тратится: транспорт записи не видел, а обрыв связи —
+        не свойство сообщения. Считать такой круг попыткой значило бы хоронить
+        очередь быстрее, чем поднимается соединение: пять кругов обычного
+        backoff укладываются в минуту, тогда как переподключение рассчитано на
+        `reconnect_max_seconds`, то есть на минуты. Сообщение умирало бы, ни
+        разу не побывав в сети.
+
+        Ждать бесконечно тоже нельзя: аккаунт может не вернуться никогда, и
+        тогда очередь растёт без границ. Предел — `offline_max_seconds`
+        непрерывного ожидания связи; дальше запись закрывается отказом, и
+        человек видит её в разборе.
+
+        Причину отсутствия связи отправка не разбирает намеренно. И обрыв, и
+        потеря авторизации, и выключенный аккаунт означают здесь одно: сейчас
+        отправить некуда. Ждать в двух последних случаях не бесполезно — вход
+        и включение возвращают связь, а срок ожидания один на все причины и не
+        даёт очереди копиться вечно.
+        """
+        now = utcnow()
+        waiting_since = self._offline_since.setdefault(item.id, now)
+        deadline = waiting_since + timedelta(seconds=self._settings.offline_max_seconds)
+        if now > deadline:
+            await self._fail(
+                item,
+                f"нет соединения дольше {self._settings.offline_max_seconds:.0f} с:"
+                " отправить было некуда",
+            )
+            return
+        # Дальше дедлайна будить запись незачем: следующий круг всё равно
+        # закрыл бы её отказом, только позже обещанного срока.
+        await self._repo.defer_claimed(
+            item.id,
+            min(now + timedelta(seconds=self._settings.offline_retry_seconds), deadline),
+        )
+        # Уровень отладочный намеренно: круг повторяется каждые несколько
+        # секунд на каждую запись, и в журнале от него остался бы один шум.
+        log.debug("отправка %s ждёт соединения по аккаунту %s", item.id, item.account_id)
+
+    async def _fail(self, item: OutboxItem, error: str) -> None:
+        """Закрывает запись отказом и жалуется, если закрывать было уже нечего.
+
+        Переход разрешён только из состояний, которыми распоряжается воркер.
+        ``False`` означает, что запись успели увести, — молчать о таком нельзя:
+        это признак гонки, а не штатный исход.
+        """
+        self._offline_since.pop(item.id, None)
+        if not await self._repo.mark_failed(item.id, error):
+            log.warning("сообщение %s закрыть отказом не удалось: состояние изменилось", item.id)
 
     async def _unknown_outcome(self, item: OutboxItem, exc: Exception) -> None:
         """Сводит неоднозначную отправку с сервером, не выходя из цикла.
@@ -218,8 +292,8 @@ class OutboxWorker:
         будить запись раньше, чем истечёт штраф сервера, нет.
         """
         if item.attempts >= self._settings.max_send_attempts:
-            await self._repo.mark_failed(
-                item.id, f"исчерпан лимит попыток ({self._settings.max_send_attempts}): {error}"
+            await self._fail(
+                item, f"исчерпан лимит попыток ({self._settings.max_send_attempts}): {error}"
             )
             return
         delay = (

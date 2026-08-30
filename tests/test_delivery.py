@@ -10,13 +10,14 @@ import pytest
 
 from maxub.config import Settings
 from maxub.core.crypto import SecretBox, SecretError
-from maxub.core.models import OutboxState, Session, utcnow
+from maxub.core.models import AccountState, OutboxState, Session, utcnow
 from maxub.core.review import discarded_event
 from maxub.core.service import ServiceError, ServiceNotFound, UserbotService
 from maxub.core.storage import Storage
 from maxub.transport.base import (
     ReconcileOutcome,
     ReconcileResult,
+    TransportAuthError,
     TransportNotApplied,
     TransportOutcomeUnknown,
     TransportRateLimited,
@@ -873,3 +874,235 @@ async def _state_is(service: UserbotService, item_id: int, state: OutboxState) -
 
 async def _has_penalty(service: UserbotService) -> bool:
     return bool(await service._storage.load_penalties())
+
+
+async def test_offline_message_waits_instead_of_burning_attempts(settings: Settings) -> None:
+    """Обрыв связи не тратит попытки: сообщение ждёт соединения и уходит.
+
+    Раньше круг «нет транспорта» шёл общим путём повторов и засчитывался
+    попыткой. Пять кругов backoff укладываются в минуту, а переподключение
+    рассчитано на минуты, — сообщение успевало закрыться отказом, ни разу не
+    побывав в сети.
+    """
+    settings.offline_retry_seconds = 0.1
+    shared = StubTransport()
+    service = UserbotService(
+        settings,
+        Storage(settings.db_path, SecretBox(settings.resolve_secret_key())),
+        lambda: shared,
+    )
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        session = Session.model_validate(await service._storage.load_session(account_id))
+        await service._connections.disconnect(account_id)
+
+        item, _ = await service.enqueue_message(account_id, "chat-1", "во время обрыва")
+        # Заведомо больше, чем лимит попыток при таком шаге ожидания: с прежней
+        # политикой запись была бы уже закрыта отказом.
+        await asyncio.sleep(1.0)
+
+        async def waiting_without_attempts() -> bool:
+            # Условием, а не мгновенным снимком: между захватом и откладыванием
+            # запись на доли миллисекунды видна захваченной, и снимок,
+            # пришедшийся ровно туда, врал бы про политику повторов.
+            stored = await service._storage.get_outbox(item.id)
+            return (
+                stored is not None
+                and stored.state is OutboxState.QUEUED
+                and stored.attempts == 0
+                and stored.next_attempt_at is not None
+            )
+
+        await wait_for(waiting_without_attempts)
+
+        await service._connections.connect(account_id, session)
+        await wait_for(lambda: _state_is(service, item.id, OutboxState.SENT))
+        history = await shared.fetch_history("chat-1", 10)
+        assert [message.text for message in history] == ["во время обрыва"]
+    finally:
+        await service.stop()
+
+
+async def test_offline_wait_has_a_deadline(settings: Settings) -> None:
+    """Ожидание связи не бесконечно: иначе очередь мёртвого аккаунта не кончится."""
+    settings.offline_retry_seconds = 0.1
+    settings.offline_max_seconds = 0.5
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        await service._connections.disconnect(account_id)
+
+        item, _ = await service.enqueue_message(account_id, "chat-1", "некуда отправлять")
+        await wait_for(lambda: _state_is(service, item.id, OutboxState.FAILED))
+        stored = await service._storage.get_outbox(item.id)
+        assert stored is not None
+        assert "нет соединения дольше" in (stored.error or "")
+        # Единственная засчитанная попытка — та, на которой запись закрыли.
+        # Остальные круги ожидания счётчик не трогали.
+        assert stored.attempts == 1
+    finally:
+        await service.stop()
+
+
+async def test_delivered_message_cannot_be_failed_and_requeued(service: UserbotService) -> None:
+    """Отказ не воскрешает отправленное: иначе получатель увидит дубль.
+
+    Путь целиком: `sent` → отказ → `failed` → ручной повтор → снова в очереди.
+    Каждое звено само по себе законно, и держаться инвариант обязан на первом
+    из них, а не на том, откуда случились вызовы.
+    """
+    account_id = await login_by_phone(service)
+    item, _ = await service.enqueue_message(account_id, "chat-1", "доставлено")
+    await wait_for(lambda: _state_is(service, item.id, OutboxState.SENT))
+
+    assert await service._storage.mark_failed(item.id, "запоздалый отказ") is False
+    stored = await service._storage.get_outbox(item.id)
+    assert stored is not None
+    assert stored.state is OutboxState.SENT
+    assert stored.error is None
+    assert await service._storage.requeue(item.id) is False
+
+    transport = service._connections.get(account_id)
+    assert isinstance(transport, StubTransport)
+    assert len(await transport.fetch_history("chat-1", 10)) == 1
+
+
+async def test_discarded_message_cannot_be_failed(service: UserbotService) -> None:
+    """Решение человека не переписывается запоздалым отказом.
+
+    Отказ вернул бы записи состояние `failed`, из которого ручной повтор
+    отправляет её штатно, — то есть отменил бы уже принятое решение не
+    отправлять.
+    """
+    item_id = await _refused_without_trace(service, "chat-discard-2", "снято")
+    await service.discard_message(item_id, "отправлять уже не нужно")
+
+    assert await service._storage.mark_failed(item_id, "запоздалый отказ") is False
+    stored = await service._storage.get_outbox(item_id)
+    assert stored is not None
+    assert stored.state is OutboxState.DISCARDED
+
+
+async def test_stop_returns_claimed_batch_to_queue(settings: Settings) -> None:
+    """Остановка возвращает в очередь пачку, до которой не дошли руки.
+
+    Флаг остановки читается в цикле отправки, а прочитать его можно, только
+    получив управление: отмена сразу за флагом не оставляла на это ни шага, и
+    захваченный остаток пачки лежал до следующего запуска. Попытка при возврате
+    откатывается — отправки не было.
+    """
+    shared = StubTransport()
+    service = UserbotService(
+        settings,
+        Storage(settings.db_path, SecretBox(settings.resolve_secret_key())),
+        lambda: shared,
+    )
+    await service.start()
+    stopped = False
+    try:
+        account_id = await login_by_phone(service)
+        # Первая отправка держит воркер, пока копится очередь: иначе он разберёт
+        # записи по одной и пачки, которую нужно вернуть, просто не будет.
+        holding = asyncio.Event()
+        shared.hold_send = holding
+        first, _ = await service.enqueue_message(account_id, "chat-1", "первое")
+        await wait_for(lambda: _state_is(service, first.id, OutboxState.SENDING))
+
+        rest = [
+            (await service.enqueue_message(account_id, "chat-1", f"пачка {index}"))[0].id
+            for index in range(3)
+        ]
+        # Следующая пачка застрянет уже на новом замке, а первая запись пойдёт
+        # дальше: так воркер оказывается посреди пачки, а не перед ней.
+        batch_hold = asyncio.Event()
+        shared.hold_send = batch_hold
+        holding.set()
+        await wait_for(lambda: _state_is(service, rest[0], OutboxState.SENDING))
+
+        async def release_after_stop() -> None:
+            # Отпускаем уже во время остановки: воркер должен успеть дочитать
+            # флаг и разобраться с остатком сам.
+            await asyncio.sleep(0.2)
+            batch_hold.set()
+
+        releasing = asyncio.create_task(release_after_stop())
+        await service.stop()
+        stopped = True
+        await releasing
+
+        storage = Storage(settings.db_path, SecretBox(settings.resolve_secret_key()))
+        await storage.open()
+        try:
+            stats = await storage.outbox_stats()
+            assert stats[OutboxState.CLAIMED.value] == 0
+            for item_id in rest[1:]:
+                stored = await storage.get_outbox(item_id)
+                assert stored is not None
+                assert stored.state is OutboxState.QUEUED
+                assert stored.attempts == 0
+        finally:
+            await storage.close()
+    finally:
+        if not stopped:
+            await service.stop()
+
+
+async def test_queued_message_cannot_be_failed(service: UserbotService) -> None:
+    """Отказ по записи, которую воркер не забирал, — это гонка, а не решение.
+
+    Вместе с двумя тестами выше это весь запрет: перевести в `failed` можно
+    только `claimed` и `sending`, то есть состояния, которыми распоряжается
+    отправка.
+    """
+    account_id = await login_by_phone(service)
+    transport = service._connections.get(account_id)
+    assert isinstance(transport, StubTransport)
+    # Отправку держим, чтобы запись успела побыть просто в очереди.
+    transport.hold_send = asyncio.Event()
+    item, _ = await service._storage.enqueue(
+        account_id, "chat-queued", "ещё в очереди", "ключ-очереди", 60.0
+    )
+
+    assert await service._storage.mark_failed(item.id, "отказ мимо очереди") is False
+    stored = await service._storage.get_outbox(item.id)
+    assert stored is not None
+    assert stored.state in (OutboxState.QUEUED, OutboxState.CLAIMED, OutboxState.SENDING)
+    assert stored.state is not OutboxState.FAILED
+    transport.hold_send.set()
+
+
+async def test_auth_loss_takes_the_transport_away_from_the_sender(settings: Settings) -> None:
+    """Отозванная сессия перестаёт быть рабочим соединением сразу.
+
+    Состояние аккаунта и пригодность транспорта — одно и то же знание. Пока
+    потеря авторизации записывалась мимо соединений, отправка продолжала ходить
+    в отозванный транспорт и закрывать отказами всё, что оставалось в очереди.
+    """
+    service = build_service(settings)
+    await service.start()
+    try:
+        account_id = await login_by_phone(service)
+        transport = service._connections.get(account_id)
+        assert isinstance(transport, StubTransport)
+        assert service._connections.live(account_id) is not None
+
+        transport.fail_sends = 1
+        transport.fail_with = TransportAuthError("сессия отозвана")
+        item, _ = await service.enqueue_message(account_id, "chat-1", "с отозванной сессией")
+
+        async def auth_required() -> bool:
+            # Ждём именно состояние аккаунта: отказ по записи пишется раньше
+            # него, и снимок по нему поймал бы момент, когда потеря авторизации
+            # ещё не записана.
+            accounts = await service.list_accounts()
+            return accounts[0].state is AccountState.AUTH_REQUIRED
+
+        await wait_for(auth_required)
+        assert await _state_is(service, item.id, OutboxState.FAILED)
+        # Объект транспорта ещё существует, но работать через него уже нельзя.
+        assert service._connections.get(account_id) is not None
+        assert service._connections.live(account_id) is None
+    finally:
+        await service.stop()

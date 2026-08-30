@@ -16,7 +16,7 @@ from collections.abc import Sequence
 
 from maxub.config import Settings
 from maxub.core.auth import LoginError, LoginService, TooManyChallenges
-from maxub.core.events import EventBus, account_state_event
+from maxub.core.events import EventBus
 from maxub.core.handlers import EventHandler, HandlerDispatcher, HandlerRegistry
 from maxub.core.housekeeping import Housekeeper
 from maxub.core.manual_retry import ManualRetry
@@ -40,6 +40,13 @@ from maxub.transport.base import Capabilities, TransportAuthError, TransportUnsu
 log = logging.getLogger(__name__)
 
 DEDUP_WINDOW_SECONDS = 60.0
+
+# Сколько ждать, пока фоновые задачи закончат текущий круг после сигнала об
+# остановке. Отмена без ожидания превращала бы штатный выход в аварийный: воркер
+# отправки, увидев флаг, возвращает в очередь захваченную, но не отправленную
+# пачку — прочитать флаг ему нужно успеть. Дальше — отмена: висеть в остановке
+# дольше нельзя, задача может стоять в долгом сетевом вызове.
+STOP_GRACE_SECONDS = 5.0
 
 # Состояния, из которых сообщение само уже не выберется: отказавшие записи ждут
 # решения человека, «в полёте» — разбора при следующем запуске демона. Остальные
@@ -112,12 +119,12 @@ class UserbotService:
         self._worker = OutboxWorker(
             repo=storage,
             limiter=self._limiter,
-            get_transport=self._connections.get,
+            get_transport=self._connections.live,
             settings=settings,
             publish=self._events.publish,
             on_auth_lost=self._on_auth_lost,
         )
-        self._manual_retry = ManualRetry(storage, self._connections.get, self._events.publish)
+        self._manual_retry = ManualRetry(storage, self._connections.live, self._events.publish)
         self._login = LoginService(self._set_state, self._connections)
         self._registry = HandlerRegistry(handlers)
         self._dispatcher = HandlerDispatcher(
@@ -178,17 +185,48 @@ class UserbotService:
             self._connections.supervise(account.id, session)
 
     async def stop(self) -> None:
+        """Останавливает фоновые задачи, дав им закончить начатое.
+
+        Сигнал и отмена разнесены во времени намеренно. Задачи выходят по флагу,
+        а прочитать его можно только получив управление: отмена сразу за
+        установкой флага не оставляет для этого ни одного шага цикла событий, и
+        аккуратный выход, написанный в
+        [OutboxWorker.run][maxub.core.sender.OutboxWorker.run], не выполняется
+        никогда. Ожидание ограничено: задача может стоять в сетевом вызове,
+        который сам по себе не кончится, — тогда её всё же отменяют.
+        """
         self._worker.stop()
         self._housekeeper.stop()
         self._dispatcher.stop()
-        for task in (self._worker_task, self._housekeeping_task, self._dispatcher_task):
-            if task is None:
-                continue
-            task.cancel()
+        tasks = [
+            task
+            for task in (self._worker_task, self._housekeeping_task, self._dispatcher_task)
+            if task is not None
+        ]
+        try:
+            if tasks:
+                await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
+        finally:
+            # Отмена — в `finally`, и это существенно: остановку саму могут
+            # отменить прямо посреди ожидания. Пропустив отмену, мы закрыли бы
+            # базу под работающим воркером, и тот пошёл бы в неё уже закрытую.
+            # `cancel()` не требует ожидания и потому срабатывает даже тогда.
+            for task in tasks:
+                task.cancel()
+            outcomes: list[BaseException | None] = []
             with contextlib.suppress(asyncio.CancelledError):
-                await task
-        await self._connections.shutdown()
-        await self._storage.close()
+                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, Exception):
+                    # Сбой фоновой задачи здесь — уже история, и прерывать
+                    # из-за него выход нельзя.
+                    log.error("фоновая задача завершилась с ошибкой: %s", outcome)
+            try:
+                await self._connections.shutdown()
+            finally:
+                # Вложенный `finally`, а не второй строкой рядом: сбой закрытия
+                # соединений иначе оставил бы открытым файл базы.
+                await self._storage.close()
 
     # --- аккаунты -----------------------------------------------------------
 
@@ -343,18 +381,16 @@ class UserbotService:
     async def _set_state(
         self, account_id: int, state: AccountState, error: str | None = None
     ) -> None:
-        """Меняет состояние аккаунта и сообщает об этом подписчикам.
+        """Меняет состояние аккаунта — тем же путём, что и сами соединения.
 
-        Тот же приём, что и в [сопровождении соединений][maxub.core.sync]: пара
-        «записать и рассказать» держится в одном месте, иначе часть переходов
-        рано или поздно останется без события.
+        Своей записи здесь нет намеренно. Состояние решает не только, что
+        показать человеку: по нему же
+        [ConnectionManager][maxub.core.sync.ConnectionManager] понимает, годен
+        ли транспорт для работы. Переход, записанный в обход, разошёлся бы с
+        этим признаком — аккаунт числился бы разлогиненным, а отправка
+        продолжала бы ходить в отозванное соединение.
         """
-        event = account_state_event(account_id, state, error)
-        if event is None:
-            await self._storage.set_account_state(account_id, state, error)
-            return
-        if await self._storage.set_account_state_with_event(account_id, state, error, event):
-            self._events.publish(event)
+        await self._connections.set_state(account_id, state, error)
 
     # --- события ------------------------------------------------------------
 
@@ -409,7 +445,7 @@ class UserbotService:
 
     def transport_capabilities(self, account_id: int) -> Capabilities | None:
         """Возможности живого соединения; ``None`` — соединения сейчас нет."""
-        transport = self._connections.get(account_id)
+        transport = self._connections.live(account_id)
         return transport.capabilities if transport is not None else None
 
     async def _handler_floor(self) -> int | None:

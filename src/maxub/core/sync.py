@@ -49,6 +49,12 @@ class ConnectionManager:
         self._publish = publish
         self._backfill = Backfiller(repo, emit)
         self._transports: dict[int, Transport] = {}
+        # Аккаунты, чей транспорт прямо сейчас годен для работы. Держится
+        # отдельно от самого словаря транспортов, потому что обрыв связи их
+        # оттуда не убирает: надзор закрывает прежний транспорт только в момент
+        # переподключения, а до тех пор — всю паузу backoff, до пяти минут —
+        # объект остаётся на месте и выглядит рабочим.
+        self._live: set[int] = set()
         # Последняя известная сессия аккаунта. Держится отдельно от той, что
         # запомнил надзор: сервер может выдать новую при любом подключении.
         self._sessions: dict[int, Session] = {}
@@ -57,6 +63,30 @@ class ConnectionManager:
     # --- доступ -------------------------------------------------------------
 
     def get(self, account_id: int) -> Transport | None:
+        """Транспорт аккаунта как объект — независимо от того, работает ли он.
+
+        Нужен входу: пока идёт вход, соединения в рабочем смысле ещё нет, а
+        разговаривать с сервером уже надо. Всем, кто собирается что-то
+        отправлять, нужен не этот метод, а
+        [live][maxub.core.sync.ConnectionManager.live].
+        """
+        return self._transports.get(account_id)
+
+    def live(self, account_id: int) -> Transport | None:
+        """Транспорт, которым прямо сейчас можно пользоваться.
+
+        Мёртвое соединение наружу не отдаётся, и это не косметика. Обрыв не
+        убирает транспорт из словаря: прежний объект закрывается только в
+        момент переподключения, а до тех пор — всю паузу backoff, до
+        `reconnect_max_seconds` — остаётся на месте и выглядит рабочим.
+        Отправка, получив такой объект, шла в закрытый сокет, считала отказ за
+        неудачную попытку и тратила лимит: пять кругов повторов укладываются в
+        минуту, и сообщение умирало, ни разу не побывав в сети, — при том что
+        соединение всё это время поднималось. Отсутствие транспорта отправка
+        понимает верно: ждёт, не тратя попыток.
+        """
+        if account_id not in self._live:
+            return None
         return self._transports.get(account_id)
 
     def ensure(self, account_id: int) -> Transport:
@@ -88,7 +118,7 @@ class ConnectionManager:
         # аккаунте недолго живут два живых потока, наперегонки пишущих курсор.
         await self._supervisors.stop(account_id)
         transport = self.ensure(account_id)
-        await self._set_state(account_id, AccountState.CONNECTING)
+        await self.set_state(account_id, AccountState.CONNECTING)
         # Разбор неудачи целиком здесь, и это не мелочь оформления. Раньше часть
         # ошибок классифицировал вызывающий, и на старте демона аккаунт получал
         # `BACKOFF` дважды: сначала отсюда, потом от того, кто поймал исключение.
@@ -101,12 +131,12 @@ class ConnectionManager:
         except TransportAuthError as exc:
             # `BACKOFF` тут обещал бы, что повтор поможет, а помогает только
             # новый вход.
-            await self._set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
+            await self.set_state(account_id, AccountState.AUTH_REQUIRED, str(exc))
             raise
         except Exception as exc:
             # Иначе аккаунт остался бы в connecting или syncing, хотя ни то, ни
             # другое уже не происходит.
-            await self._set_state(account_id, AccountState.BACKOFF, str(exc))
+            await self.set_state(account_id, AccountState.BACKOFF, str(exc))
             raise
         self._start_supervisor(account_id, session, pump)
         return session
@@ -128,7 +158,7 @@ class ConnectionManager:
         того, как подписка подтверждена и пережила добор: `READY` при мёртвом
         потоке — это аккаунт, за которым никто не слушает сервер.
         """
-        await self._set_state(account_id, AccountState.SYNCING)
+        await self.set_state(account_id, AccountState.SYNCING)
         pump = await open_stream(
             account_id,
             transport,
@@ -136,7 +166,7 @@ class ConnectionManager:
             self._emit,
             partial(self._backfill.run, account_id, transport),
         )
-        await self._set_state(account_id, AccountState.READY)
+        await self.set_state(account_id, AccountState.READY)
         await self._emit(
             Event(
                 account_id=account_id,
@@ -156,7 +186,7 @@ class ConnectionManager:
             account_id,
             ConnectionSupervisor(
                 account_id,
-                partial(self._set_state, account_id),
+                partial(self.set_state, account_id),
                 self._settings,
                 partial(self._reconnect, account_id, session),
             ),
@@ -178,14 +208,14 @@ class ConnectionManager:
         # переподключение раз за разом ходило бы с протухшим токеном.
         session = self._sessions.get(account_id, session)
         try:
-            await self._set_state(account_id, AccountState.CONNECTING)
+            await self.set_state(account_id, AccountState.CONNECTING)
             await self._remember(account_id, session, await transport.connect(session))
             return await self._open_stream(account_id, transport)
         except BaseException:
             await self._close_transport(account_id)
             raise
 
-    async def _set_state(
+    async def set_state(
         self, account_id: int, state: AccountState, error: str | None = None
     ) -> None:
         """Меняет состояние аккаунта и сообщает об этом подписчикам.
@@ -193,7 +223,19 @@ class ConnectionManager:
         Единая точка, а не пара вызовов на каждом переходе: половина переходов
         осталась бы без события при первой же правке, и подписчик узнавал бы о
         потере авторизации только опросом статуса.
+
+        Публичная и единственная: через неё идут и переходы, случившиеся вне
+        соединений, — вход, выключение аккаунта, потеря авторизации при
+        отправке. Здесь же обновляется признак пригодности транспорта, и
+        запись состояния в обход рассинхронизировала бы их: аккаунт числился бы
+        разлогиненным, а отправка продолжала бы ходить в отозванное соединение.
         """
+        # Годным транспорт считается только в `ready`. Все прочие состояния —
+        # это либо ещё не поднятое соединение, либо уже не работающее.
+        if state is AccountState.READY:
+            self._live.add(account_id)
+        else:
+            self._live.discard(account_id)
         event = account_state_event(account_id, state, error)
         if event is None:
             await self._repo.set_account_state(account_id, state, error)
@@ -220,6 +262,7 @@ class ConnectionManager:
     # --- остановка ----------------------------------------------------------
 
     async def _close_transport(self, account_id: int) -> None:
+        self._live.discard(account_id)
         transport = self._transports.pop(account_id, None)
         if transport is not None:
             with contextlib.suppress(Exception):
@@ -237,3 +280,4 @@ class ConnectionManager:
             with contextlib.suppress(Exception):
                 await transport.disconnect()
         self._transports.clear()
+        self._live.clear()

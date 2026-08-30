@@ -102,4 +102,7 @@ class Reconciler:
             log.info("возвращено в очередь после перезапуска: %s", released)
 
     async def _fail(self, item: OutboxItem, reason: str) -> None:
-        await self._repo.mark_failed(item.id, f"{UNKNOWN_OUTCOME}: {reason}")
+        if not await self._repo.mark_failed(item.id, f"{UNKNOWN_OUTCOME}: {reason}"):
+            # Запись увели, пока шла сверка. Дописывать ей исход теперь нечего:
+            # ею распоряжается кто-то другой.
+            log.warning("сообщение %s закрыть отказом не удалось: состояние изменилось", item.id)

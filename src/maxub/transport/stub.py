@@ -59,6 +59,10 @@ class StubTransport:
         self.reconcile_inconclusive = False
         #: Заставляет ближайшее подключение вернуть обновлённую сессию.
         self.rotate_token_on_connect = False
+        #: Задерживает отправку, пока событие не выставят, — для тестов, где
+        #: важно застать воркер посреди пачки: остальные её записи в этот
+        #: момент захвачены и никуда не движутся.
+        self.hold_send: asyncio.Event | None = None
 
     # --- авторизация --------------------------------------------------------
 
@@ -132,6 +136,8 @@ class StubTransport:
 
     async def send_text(self, chat_id: str, text: str, client_token: str) -> str:
         self._require_connection()
+        if self.hold_send is not None:
+            await self.hold_send.wait()
         if self.fail_sends > 0:
             self.fail_sends -= 1
             error = self.fail_with or TransportAuthError("имитация сбоя отправки")

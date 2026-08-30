@@ -744,3 +744,59 @@ async def test_supervisor_reports_backoff_to_subscribers(settings: Settings) -> 
         await _wait(announced)
     finally:
         await service.stop()
+
+
+async def test_dead_transport_is_not_handed_to_the_sender(settings: Settings) -> None:
+    """Пока идёт переподключение, отправке транспорт не достаётся.
+
+    Обрыв не убирает транспорт из словаря: прежний объект закрывается только в
+    момент новой попытки, а до тех пор — всю паузу backoff — остаётся на месте.
+    Отправка, получив его, шла в мёртвый сокет и считала отказ попыткой: пять
+    кругов повторов укладываются в минуту, и сообщение умирало, пока соединение
+    ещё поднималось.
+    """
+    transport = DyingStreamStub()
+    await _login_then_stop(settings, transport)
+
+    transport.dying_streams = 1
+    slow = settings.model_copy(
+        update={
+            "reconnect_base_seconds": 1.0,
+            "reconnect_max_seconds": 1.0,
+            "offline_retry_seconds": 0.05,
+        }
+    )
+    restarted = _service_over(slow, transport)
+    await restarted.start()
+    try:
+        accounts = await restarted.list_accounts()
+        account_id = accounts[0].id
+
+        async def in_backoff() -> bool:
+            current = await restarted.list_accounts()
+            return current[0].state is AccountState.BACKOFF
+
+        await _wait(in_backoff)
+        # Объект на месте — закрывать его будет переподключение.
+        assert restarted._connections.get(account_id) is not None
+        # Наружу он при этом не отдаётся: работать через него нельзя.
+        assert restarted._connections.live(account_id) is None
+
+        # Через сервис такую запись не поставить — аккаунт не готов; очередь
+        # наполняет тот, кто ставил сообщение, пока связь ещё была.
+        item, _ = await restarted._storage.enqueue(
+            account_id, "chat-backoff", "во время обрыва", "ключ-обрыва", 60.0
+        )
+
+        async def sent() -> bool:
+            stored = await restarted._storage.get_outbox(item.id)
+            return stored is not None and stored.state is OutboxState.SENT
+
+        await _wait(sent)
+        stored = await restarted._storage.get_outbox(item.id)
+        assert stored is not None
+        # Ровно одна попытка — та, на которой сообщение и ушло. Круги ожидания
+        # связи счётчик не тратили.
+        assert stored.attempts == 1
+    finally:
+        await restarted.stop()

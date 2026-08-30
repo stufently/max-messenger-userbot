@@ -191,9 +191,31 @@ class DeliveryMixin(EventsMixin):
                 return False
             return await self.insert_event(event)
 
-    async def mark_failed(self, item_id: int, error: str) -> None:
+    async def mark_failed(self, item_id: int, error: str) -> bool:
+        """Закрывает отказом запись, которой распоряжается воркер.
+
+        Состояние проверяется наравне с остальными переходами, и по той же
+        причине. Из завершённых состояний запись не воскрешается: отказ, попавший
+        на уже отправленное сообщение, перевёл бы его в ``failed``, откуда
+        [requeue][maxub.core.storage.delivery.DeliveryMixin.requeue] штатно
+        возвращает запись в очередь, — и получатель увидел бы её второй раз.
+        Живого пути к такому сейчас нет, все вызовы приходят на ``claimed`` и
+        ``sending``, но держаться инвариант должен на схеме, а не на том, откуда
+        случились вызовы.
+
+        ``False`` означает «запись уже не в работе»: её увели, отправили или
+        закрыли. Это признак гонки, и вызывающему о нём сообщают, а не
+        проглатывают.
+        """
         async with self.write() as db:
-            await db.execute(
-                "UPDATE outbox SET state = ?, error = ? WHERE id = ?",
-                (OutboxState.FAILED.value, error, item_id),
+            cursor = await db.execute(
+                "UPDATE outbox SET state = ?, error = ? WHERE id = ? AND state IN (?, ?)",
+                (
+                    OutboxState.FAILED.value,
+                    error,
+                    item_id,
+                    OutboxState.CLAIMED.value,
+                    OutboxState.SENDING.value,
+                ),
             )
+        return cursor.rowcount == 1
