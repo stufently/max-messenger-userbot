@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 
 import click
 import pytest
@@ -318,16 +319,43 @@ def test_stuck_secret_file_is_explained_without_traceback(
 
 
 def test_vendored_click_exceptions_are_covered() -> None:
-    """Копия click внутри typer обязана попадать в обработчики.
+    """Копия click внутри typer обязана попадать в обработчики целиком.
 
     Это корень ошибки, ради которой заведён `cli/errors.py`: у вендорной копии
     собственное дерево классов, не пересекающееся с внешним click, поэтому
     `except click.ClickException` пропускал ошибки разбора аргументов мимо.
     Проверка держит связь с обеими копиями при обновлении typer.
+
+    Дерево обходится целиком, а не по паре знакомых имён: раскладка внутри
+    typer — не контракт и меняется молча. В 0.27 из `typer._click.exceptions`
+    пропали `Exit` и `Abort` — они и раньше принадлежали не click, а самому
+    typer, — и проверка по именам сломалась на ровном месте, хотя ловилось всё
+    как надо. Здесь берётся то, что в копии действительно есть.
     """
     vendored = pytest.importorskip("typer._click")
 
-    assert issubclass(vendored.exceptions.MissingParameter, cli_errors.USAGE)
-    assert issubclass(vendored.exceptions.UsageError, cli_errors.USAGE)
-    assert issubclass(vendored.exceptions.Exit, cli_errors.EXITS)
+    usage = [
+        candidate
+        for candidate in vars(vendored.exceptions).values()
+        if isinstance(candidate, type) and issubclass(candidate, vendored.exceptions.ClickException)
+    ]
+    # Пустое дерево означало бы, что проверять стало нечего, — а это само по
+    # себе новость, о которой надо узнать от теста, а не от пользователя.
+    assert len(usage) >= 3
+    for exception in usage:
+        assert issubclass(exception, cli_errors.USAGE), exception
     assert issubclass(click.ClickException, cli_errors.USAGE)
+
+    # Сигналы «отработали» и «прервано» typer держит у себя, а вендорная копия
+    # их переэкспортирует; лежать они могут в любом её модуле.
+    for name, handled in (("Exit", cli_errors.EXITS), ("Abort", cli_errors.ABORTS)):
+        signals = {
+            candidate
+            for module in vars(vendored).values()
+            if isinstance(module, ModuleType)
+            for attribute, candidate in vars(module).items()
+            if attribute == name and isinstance(candidate, type)
+        }
+        assert signals, f"в копии click внутри typer не нашлось {name}"
+        for signal in signals:
+            assert issubclass(signal, handled), signal
