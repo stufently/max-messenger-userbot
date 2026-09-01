@@ -20,7 +20,7 @@
 # репозиторий Debian, а тот изменяемый — по тем же именам пакетов через полгода
 # встал бы другой Wine, то есть exe собрался бы в другой среде. Поэтому
 # источники apt ниже переключаются на снимок репозитория (snapshot.debian.org).
-FROM debian@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4
+FROM debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
 # debian:trixie-slim
 
 # Версия Python зафиксирована. Сумма — SHA-256, опубликованная python.org на
