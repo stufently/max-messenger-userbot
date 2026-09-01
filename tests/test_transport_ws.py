@@ -9,11 +9,11 @@
 пользователя на живом соединении. Обновление до 17.0 из-за этого и было
 отложено (причина записана в `packaging/constraints.txt`).
 
-Здесь наоборот: библиотека настоящая, сокет настоящий, JSON по проводу
-настоящий — выдуман только собеседник. Сервер отвечает ровно на то, что PyMax
-спрашивает при web-входе по сохранённому токену: `SESSION_INIT`, `LOGIN`,
-`PING`, `MSG_SEND`. Аккаунта MAX не требуется, наружу тест не ходит: адрес
-задаётся явно и указывает на 127.0.0.1.
+Здесь наоборот: библиотека настоящая, сокет настоящий, бинарные msgpack-кадры
+по проводу настоящие — выдуман только собеседник. Сервер отвечает ровно на то,
+что PyMax спрашивает при web-входе по сохранённому токену: `SESSION_INIT`,
+`LOGIN`, `PING`, `MSG_SEND`. Аккаунта MAX не требуется, наружу тест не ходит:
+адрес задаётся явно и указывает на 127.0.0.1.
 
 Именно «указывает явно» здесь не формальность. При отладке этого теста
 незаданный адрес однажды увёл клиент на настоящий `wss://ws-api.oneme.ru`, и
@@ -31,14 +31,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import socket
+import struct
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
 
 pytest.importorskip("pymax", reason="транспорт pymax ставится отдельным extra")
+msgpack = pytest.importorskip("msgpack", reason="msgpack приходит вместе с pymax")
 serve = pytest.importorskip(
     "websockets.asyncio.server", reason="websockets приходит вместе с pymax"
 ).serve
@@ -50,12 +51,16 @@ from maxub.transport.pymax_client import build_extra_config  # noqa: E402
 from maxub.transport.pymax_runtime import ClientRuntime  # noqa: E402
 from maxub.transport.pymax_session import Envelope, decode, encode  # noqa: E402
 
-# Опкоды внутреннего протокола MAX (`pymax.protocol.enums.Opcode`) и типы кадров
-# (`Command`). Продублированы числами намеренно: сервер обязан говорить теми же
-# значениями, что уходят по проводу, а не теми, которые библиотека сегодня
-# держит в перечислении. Разъедься они — это и есть поломка, которую тест ловит.
+# Версия, опкоды внутреннего протокола MAX (`pymax.protocol.enums.Opcode`) и
+# типы кадров (`Command`). Продублированы числами намеренно: сервер обязан
+# говорить теми же значениями, что уходят по проводу, а не теми, которые
+# библиотека сегодня держит в перечислении. Разъедься они — это и есть поломка,
+# которую тест ловит.
+PROTOCOL_VERSION = 10
 SESSION_INIT, PING, LOGIN, MSG_SEND, NOTIF_MESSAGE = 6, 1, 19, 64, 128
 REQUEST, RESPONSE = 0, 1
+FRAME_HEADER = struct.Struct(">BBHHI")
+PAYLOAD_LENGTH_MASK = 0x00FFFFFF
 
 #: Все ожидания в тесте короткие: штатный `CONNECT_WAIT` адаптера — 60 секунд, и
 #: молчащий сервер держал бы раннер минуту вместо внятного падения.
@@ -88,6 +93,50 @@ def _message(
     return body
 
 
+def _pack_frame(
+    *,
+    cmd: int,
+    seq: int,
+    opcode: int,
+    payload: dict[str, Any],
+) -> bytes:
+    packed_payload = msgpack.packb(payload, use_bin_type=True)
+    assert len(packed_payload) <= PAYLOAD_LENGTH_MASK, "payload не помещается в кадр MAX"
+    return FRAME_HEADER.pack(
+        PROTOCOL_VERSION,
+        cmd,
+        seq,
+        opcode,
+        len(packed_payload),  # старший байт — нулевые флаги сжатия
+    ) + bytes(packed_payload)
+
+
+def _unpack_frame(raw: Any) -> dict[str, Any]:
+    assert isinstance(raw, bytes), "MAX обязан прислать бинарный websocket-кадр"
+    assert len(raw) >= FRAME_HEADER.size, (
+        f"кадр MAX короче заголовка: {len(raw)} < {FRAME_HEADER.size}"
+    )
+    ver, cmd, seq, opcode, packed_len = FRAME_HEADER.unpack(raw[: FRAME_HEADER.size])
+    flags = packed_len >> 24
+    payload_len = packed_len & PAYLOAD_LENGTH_MASK
+    assert flags == 0, f"в тесте не ожидается сжатый payload: flags={flags}"
+    assert len(raw) == FRAME_HEADER.size + payload_len, (
+        "длина кадра MAX не совпадает с заголовком: "
+        f"{len(raw)} != {FRAME_HEADER.size} + {payload_len}"
+    )
+    packed_payload = raw[FRAME_HEADER.size :]
+    payload = (
+        msgpack.unpackb(packed_payload, raw=False, strict_map_key=False) if packed_payload else {}
+    )
+    return {
+        "ver": ver,
+        "cmd": cmd,
+        "seq": seq,
+        "opcode": opcode,
+        "payload": payload,
+    }
+
+
 class FakeMax:
     """Сервер MAX ровно в том объёме, который нужен web-входу по токену.
 
@@ -111,7 +160,7 @@ class FakeMax:
     async def handle(self, ws: Any) -> None:
         self.origins.append(ws.request.headers.get("Origin"))
         async for raw in ws:
-            frame = json.loads(raw)
+            frame = _unpack_frame(raw)
             self.inbox.append(frame)
             opcode, seq = frame["opcode"], frame["seq"]
             if opcode == SESSION_INIT:
@@ -121,13 +170,11 @@ class FakeMax:
                 # Событие уходит сразу за логином: до него клиент ещё не считает
                 # себя запущенным и обработчик сообщений не подписан.
                 await ws.send(
-                    json.dumps(
-                        {
-                            "opcode": NOTIF_MESSAGE,
-                            "cmd": REQUEST,
-                            "seq": 0,
-                            "payload": _message(11, text="привет", sender=PEER_ID),
-                        }
+                    _pack_frame(
+                        opcode=NOTIF_MESSAGE,
+                        cmd=REQUEST,
+                        seq=0,
+                        payload=_message(11, text="привет", sender=PEER_ID),
                     )
                 )
                 self.event_delivered.set()
@@ -136,7 +183,7 @@ class FakeMax:
             elif opcode == MSG_SEND:
                 sent = frame["payload"]["message"]["text"]
                 await self._respond(ws, opcode, seq, _message(12, text=sent, sender=SELF_ID))
-            else:  # pragma: no cover — сервер обязан молчать, а не гадать
+            else:  # pragma: no cover — сервер обязан падать, а не гадать
                 raise AssertionError(f"неожиданный опкод {opcode}")
 
     def _login_payload(self) -> dict[str, Any]:
@@ -152,9 +199,7 @@ class FakeMax:
 
     @staticmethod
     async def _respond(ws: Any, opcode: int, seq: int, payload: dict[str, Any]) -> None:
-        await ws.send(
-            json.dumps({"opcode": opcode, "cmd": RESPONSE, "seq": seq, "payload": payload})
-        )
+        await ws.send(_pack_frame(opcode=opcode, cmd=RESPONSE, seq=seq, payload=payload))
 
     async def hang_up(self) -> None:
         """Закрывает соединение со своей стороны — как это делает MAX."""
@@ -260,7 +305,7 @@ async def test_handshake_and_login_really_go_over_the_socket(
         assert await transport.connect(web_session()) is None
 
     handshake = max_server.first(SESSION_INIT)
-    assert handshake["ver"] == 11
+    assert handshake["ver"] == PROTOCOL_VERSION
     assert handshake["cmd"] == REQUEST
     assert handshake["payload"]["userAgent"]["deviceType"] == "WEB"
     assert handshake["payload"]["deviceId"] == DEVICE_ID

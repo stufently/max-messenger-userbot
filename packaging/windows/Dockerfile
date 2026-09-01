@@ -20,7 +20,7 @@
 # репозиторий Debian, а тот изменяемый — по тем же именам пакетов через полгода
 # встал бы другой Wine, то есть exe собрался бы в другой среде. Поэтому
 # источники apt ниже переключаются на снимок репозитория (snapshot.debian.org).
-FROM debian@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4
+FROM debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 # debian:trixie-slim
 
 # Версия Python зафиксирована. Сумма — SHA-256, опубликованная python.org на
@@ -32,8 +32,8 @@ FROM debian@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed
 # третье место, где версия прошита, — и путь к интерпретатору ниже собирается из
 # него, а не пишется заново: раньше `C:\Python313` стоял в двух местах, и при
 # обновлении версии второе молча осталось бы с прежним номером.
-ARG PYTHON_VERSION=3.14.6
-ARG PYTHON_SHA256=14b3e9a710a3fcf0bd9b55ab6b60412bd91227563f813fc49040cabc0209e0bd
+ARG PYTHON_VERSION=3.14.7
+ARG PYTHON_SHA256=9d9eb2709ef81bf5cd30db3c2096bdbc4ea10087c22e62f27d356b36f6ae9649
 ARG PYTHON_DIR="C:\\Python314"
 
 # Дата снимка репозитория Debian. Взята не на глаз: официальный образ Debian сам
@@ -44,7 +44,7 @@ ARG PYTHON_DIR="C:\\Python314"
 # зависимости перестают разрешаться на ровном месте. При смене digest дату надо
 # перечитать из самого образа, а не подставить сегодняшнюю:
 #   docker run --rm debian@<digest> cat /etc/apt/sources.list.d/debian.sources
-ARG DEBIAN_SNAPSHOT=20260713T000000Z
+ARG DEBIAN_SNAPSHOT=20260824T000000Z
 
 # UID/GID того, кто собирает. Wine отказывается работать с префиксом, который
 # ему не принадлежит («'/opt/wine' is not owned by you»), — прав на запись мало,
