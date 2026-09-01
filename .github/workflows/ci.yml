@@ -294,6 +294,129 @@ jobs:
             "Тесты в образе" \
             "${RUNNER_TEMP}/pytest-image.log" "${RUNNER_TEMP}/pytest-image.status"
 
+  constraints:
+    name: Пины не противоречат объявленным границам
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PRIMARY_PYTHON }}
+
+      - name: Install the version parser
+        # `packaging` — единственная зависимость шага, и она же эталонная
+        # реализация разбора версий и границ. Свой разбор здесь был бы третьим
+        # мнением о том, что значит `>=2.4.1,<2.5`, и разошёлся бы с pip на
+        # первом же нестандартном номере.
+        run: python -m pip install --upgrade pip && python -m pip install packaging
+
+      - name: Pinned versions satisfy the bounds declared in pyproject
+        # Зачем эта проверка. В pyproject объявлены границы («работаю с
+        # maxapi-python от 2.4.1 и ниже 2.5»), а в packaging/constraints.txt
+        # стоят точные версии. Это два независимых файла, и ничто не мешает им
+        # разъехаться: пин уезжает за границу — и набор перестаёт разрешаться
+        # вовсе. Так и случилось 01.09.2026, когда Dependabot поднял
+        # `maxapi-python` до 2.4.1 при границе `<2.4`.
+        #
+        # Поймать это было чем и раньше: job `docker` собирает образ по этому
+        # самому файлу ограничений и краснел. Но краснел он дампом резолвера pip
+        # на сотню строк посреди сборки, из которого не следует ни что делать,
+        # ни что вообще произошло. Здесь то же расхождение называется одной
+        # строкой и с советом — а стоит проверка секунды и не требует сети.
+        #
+        # Проверка намеренно НЕ заменяет собой решение человека. Верхняя граница
+        # у `maxapi-python` стоит потому, что это единственная зависимость,
+        # говорящая с внутренним API MAX: её минорное обновление меняет
+        # протокол, а не только состав (2.4.0 сменил кадр websocket с JSON на
+        # бинарный msgpack). Поэтому правильный ответ на красную проверку —
+        # поднять границу осознанно и прогнать сокетный гейт, а не подогнать
+        # числа друг под друга.
+        run: |
+          python - <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
+          from packaging.version import InvalidVersion, Version
+
+          constraints = Path("packaging/constraints.txt")
+          pins: dict[str, str] = {}
+          for number, raw in enumerate(constraints.read_text().splitlines(), 1):
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              # Файл ограничений по своему смыслу состоит из точных версий.
+              # Строка другой формы — это не «нестрашно», а молча ослабленное
+              # закрепление, ради которого файл и заведён.
+              name, sep, version = line.partition("==")
+              if not sep or not version:
+                  sys.exit(f"{constraints}:{number}: не форма `имя==версия`: {line!r}")
+              try:
+                  Version(version)
+              except InvalidVersion:
+                  sys.exit(f"{constraints}:{number}: непонятная версия: {version!r}")
+              pins[canonicalize_name(name)] = version
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          declared: list[tuple[str, Requirement]] = [
+              ("dependencies", Requirement(item)) for item in project.get("dependencies", [])
+          ]
+          for extra, items in project.get("optional-dependencies", {}).items():
+              declared += [(f"optional-dependencies.{extra}", Requirement(item)) for item in items]
+
+          checked = 0
+          broken: list[str] = []
+          transport_involved = False
+          for where, requirement in declared:
+              pin = pins.get(canonicalize_name(requirement.name))
+              # Объявленного пакета может не быть в файле ограничений: extra
+              # `keyring` в дистрибутив не входит и не закрепляется. Это законно,
+              # и молчание здесь правильное — сверять нечего.
+              if pin is None:
+                  continue
+              checked += 1
+              if not requirement.specifier.contains(pin, prereleases=True):
+                  broken.append(
+                      f"{requirement.name}: закреплено {pin}, "
+                      f"а pyproject [{where}] разрешает {requirement.specifier}"
+                  )
+                  if canonicalize_name(requirement.name) == "maxapi-python":
+                      transport_involved = True
+
+          # Ноль сверок означает, что разбор перестал находить то, что сверяет, —
+          # и проверка стала зелёной, ничего не проверяя. Такое молчание в этом
+          # репозитории уже стоило полутора месяцев зелёного CI над неработавшим
+          # шагом, поэтому оно объявляется отказом.
+          if checked == 0:
+              sys.exit("не сверено ни одной зависимости — проверка перестала проверять")
+
+          if broken:
+              print("\n".join(f"РАСХОЖДЕНИЕ: {item}" for item in broken), file=sys.stderr)
+              advice = [
+                  "Пин и объявленная граница разъехались: такой набор не установится.",
+                  "Решается это в pyproject — осознанным подъёмом границы, а не "
+                  "подгонкой пина под неё: граница описывает, с какими версиями "
+                  "код работает, и молча расширять её нельзя.",
+              ]
+              # Про транспорт напоминается только когда речь о нём: совет,
+              # который печатается всегда, перестают читать.
+              if transport_involved:
+                  advice.append(
+                      "У maxapi-python это особенно так: её минор меняет протокол "
+                      "общения с MAX (2.4.0 сменил кадр websocket с JSON на бинарный "
+                      "msgpack). После подъёма границы обязателен прогон "
+                      "tests/test_transport_ws.py — он единственный доходит до сокета."
+                  )
+              sys.exit("\n".join(advice))
+
+          print(f"сверено объявленных зависимостей: {checked}; расхождений нет")
+          PY
+
   versions:
     name: Версии Python согласованы
     runs-on: ubuntu-latest
