@@ -427,3 +427,37 @@ def test_endpoint_defaults_to_the_library_address() -> None:
     )
     assert "url" in overridden.model_fields_set
     assert overridden.url == "ws://127.0.0.1:9/websocket"
+
+
+async def test_mobile_device_is_created_by_pymax_and_preserved_in_session() -> None:
+    """TCP-клиент сам выбирает согласованные app_version и build_number."""
+    import pymax
+    from pymax.session.models import SessionInfo
+
+    from maxub.transport.pymax_client import session_from
+
+    runtime = ClientRuntime()
+    extra = build_extra_config(pymax, runtime, web=False, proxy=None, request_timeout=WAIT)
+    assert extra.user_agent is None
+    agent = extra.generate_user_agent("26.8.1", 12345)
+    await runtime.store.save_session(
+        SessionInfo(
+            token="mobile-test-token",
+            device_id="mobile-test-device",
+            phone="+79990000000",
+            user_agent=agent,
+        )
+    )
+    session = session_from(runtime, 1, phone="+79990000000", kind="tcp")
+    envelope = decode(session.token)
+    assert envelope.user_agent == agent.model_dump(mode="json")
+    restored = build_extra_config(
+        pymax,
+        ClientRuntime(),
+        web=False,
+        proxy=None,
+        request_timeout=WAIT,
+        envelope=envelope,
+        device_id=session.device_id,
+    )
+    assert restored.user_agent == agent

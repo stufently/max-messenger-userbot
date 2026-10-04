@@ -83,12 +83,17 @@ def _user_agent(extra: Any, *, web: bool, envelope: Envelope | None) -> Any:
     десяток разных телефонов на одном аккаунте — ровно то поведение, за которое
     аккаунты и блокируют.
     """
-    fresh = extra.generate_web_user_agent() if web else extra.generate_user_agent()
     saved = envelope.user_agent if envelope else None
+    # TCP-клиент выбирает app_version и build_number после загрузки каталога
+    # версий. Генерация здесь обходила этот шаг и падала на обязательных
+    # аргументах generate_user_agent. Веб-клиент каталога не требует.
+    fresh = extra.generate_web_user_agent() if web else None
     if saved is None:
         return fresh
     try:
-        return type(fresh).model_validate(saved)
+        # Оба клиента используют одну модель payload, но разный device_type.
+        payload_type = type(fresh if fresh is not None else extra.generate_web_user_agent())
+        return payload_type.model_validate(saved)
     except Exception:
         # Прежний отпечаток не читается: подключение важнее маскировки.
         return fresh

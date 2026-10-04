@@ -185,7 +185,12 @@ class ClientRuntime:
         return ident if isinstance(ident, int) else None
 
     def user_agent_dump(self) -> dict[str, Any] | None:
-        agent = getattr(self.extra, "user_agent", None)
+        # PyMax сохраняет фактически выбранное устройство в SessionInfo.
+        # Для свежего TCP-входа extra.user_agent остаётся None: устройство
+        # генерирует сам клиент после загрузки каталога версий.
+        agent = getattr(self.store.saved, "user_agent", None)
+        if agent is None:
+            agent = getattr(self.extra, "user_agent", None)
         if agent is None:
             return None
         try:

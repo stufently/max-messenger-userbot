@@ -72,6 +72,7 @@ class FakeSessionInfo(BaseModel):
     device_id: str
     phone: str = ""
     mt_instance_id: str = ""
+    user_agent: FakeUserAgent | None = None
 
 
 class FakeMessage:
@@ -96,7 +97,7 @@ class FakeExtraConfig:
         self.mt_instance_id = "mt-generated"
         self.user_agent: Any = None
 
-    def generate_user_agent(self) -> FakeUserAgent:
+    def generate_user_agent(self, app_version: str, build_number: int) -> FakeUserAgent:
         return FakeUserAgent()
 
     def generate_web_user_agent(self) -> FakeUserAgent:
@@ -209,6 +210,8 @@ class FakeClient:
                 device_id=getattr(self.extra_config, "device_id", None) or "device-1",
                 phone=self.phone or "",
                 mt_instance_id=self.extra_config.mt_instance_id,
+                user_agent=self.extra_config.user_agent
+                or self.extra_config.generate_user_agent("test-version", 12345),
             )
         )
         for callback in self._on_start:
