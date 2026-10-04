@@ -44,7 +44,7 @@ ARG PYTHON_DIR="C:\\Python314"
 # зависимости перестают разрешаться на ровном месте. При смене digest дату надо
 # перечитать из самого образа, а не подставить сегодняшнюю:
 #   docker run --rm debian@<digest> cat /etc/apt/sources.list.d/debian.sources
-ARG DEBIAN_SNAPSHOT=20260824T000000Z
+ARG DEBIAN_SNAPSHOT=20260918T000000Z
 
 # UID/GID того, кто собирает. Wine отказывается работать с префиксом, который
 # ему не принадлежит («'/opt/wine' is not owned by you»), — прав на запись мало,
