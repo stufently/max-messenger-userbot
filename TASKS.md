@@ -6,11 +6,17 @@
 
 ## IN_PROGRESS
 
-- **04.10.2026 — PR #10 и #11: исправления CI подготовлены.** Локальная проверка
-  выполняется; после push требуется проверить задания GitHub Actions
-  на Windows и итоговый прогон main. Изменения — в [CHANGELOG.md](CHANGELOG.md).
+Пусто.
 
 ## Сделано за последние дни
+
+- **04.10.2026 — PR #10 и #11 исправлены и слиты в main.** Итоговый код
+  `b415ba3`: все 11 заданий [CI](https://github.com/stufently/max-messenger-userbot/actions/runs/37190812939)
+  и [Windows build](https://github.com/stufently/max-messenger-userbot/actions/runs/37190812989)
+  успешны, включая запуск exe. Локально: 378 тестов прошли, 1 пропущен;
+  линтер, типы, pip check и 6 сокетных проверок зелёные; оба exe собраны и
+  проверены под Wine. Codex и Antigravity приняли план и результат без
+  замечаний. Изменения — в [CHANGELOG.md](CHANGELOG.md).
 
 - **01.09.2026 — обновление зависимостей и базовых образов.** Работа из ветки
   `deps-refresh-2026-09` завершена по
