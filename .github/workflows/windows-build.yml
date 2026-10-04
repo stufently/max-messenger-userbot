@@ -72,6 +72,12 @@ jobs:
           # сборки под Wine и на раннере должны совпадать по интерпретатору.
           python-version: "3.14.7"
 
+      - name: Upgrade pip
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
+          PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
+        run: python -m pip install --upgrade pip
+
       - name: Install project and build tools
         # Версии закреплены файлом ограничений: это релизный артефакт, и его
         # состав не должен зависеть от того, что вышло на PyPI в день сборки.
@@ -88,10 +94,8 @@ jobs:
         env:
           PIP_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
           PIP_BUILD_CONSTRAINT: ${{ github.workspace }}/packaging/constraints.txt
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install ".[pymax]"
-          python -m pip install pyinstaller
+        # Один вызов pip на шаг: PowerShell иначе скрывает промежуточный отказ.
+        run: python -m pip install ".[pymax]" pyinstaller
 
       - name: Build exe
         run: python -m PyInstaller --noconfirm --clean packaging/windows/maxub.spec
