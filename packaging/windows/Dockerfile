@@ -20,7 +20,7 @@
 # репозиторий Debian, а тот изменяемый — по тем же именам пакетов через полгода
 # встал бы другой Wine, то есть exe собрался бы в другой среде. Поэтому
 # источники apt ниже переключаются на снимок репозитория (snapshot.debian.org).
-FROM debian@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
+FROM debian@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 # debian:trixie-slim
 
 # Версия Python зафиксирована. Сумма — SHA-256, опубликованная python.org на
@@ -44,7 +44,7 @@ ARG PYTHON_DIR="C:\\Python314"
 # зависимости перестают разрешаться на ровном месте. При смене digest дату надо
 # перечитать из самого образа, а не подставить сегодняшнюю:
 #   docker run --rm debian@<digest> cat /etc/apt/sources.list.d/debian.sources
-ARG DEBIAN_SNAPSHOT=20260918T000000Z
+ARG DEBIAN_SNAPSHOT=20261027T000000Z
 
 # UID/GID того, кто собирает. Wine отказывается работать с префиксом, который
 # ему не принадлежит («'/opt/wine' is not owned by you»), — прав на запись мало,
