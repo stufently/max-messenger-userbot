@@ -74,7 +74,7 @@ uvicorn==0.54.0
 # Переход 2.3.1 → 2.4.1 сменил кадр web-транспорта с JSON на бинарный msgpack.
 # Верхняя граница в pyproject поднята до `<2.5`: следующий минор надо снова
 # разрешить осознанно, а не автоматически.
-maxapi-python==2.5.0
+maxapi-python==2.4.1
 
 # Транзитивные от неё. Ставятся только вместе с extra: без `pymax` pip их не
 # запросит, и строки ниже ничего не сделают.
@@ -85,7 +85,7 @@ aiosignal==1.4.0
 attrs==26.1.0
 frozenlist==1.8.0
 msgpack==1.2.4
-# aiohttp 3.14.3 requires multidict<7.0.
+# aiohttp 3.14.5 requires multidict<8.0.
 multidict==7.2.1
 propcache==0.5.4
 python-socks==3.2.0
@@ -118,12 +118,14 @@ httpcore==1.0.9
 idna==3.20
 markdown-it-py==4.2.0
 mdurl==0.1.2
+# Транзитивная от fastapi 0.162 (`opentelemetry-api>=1.44.0`).
+opentelemetry-api==1.45.2
 packaging==26.3
 pycparser==3.12
 # Закреплена ровно на версии, которую требует `pydantic`
-# (`pydantic-core==2.46.5`), и набор с другой версией не ставится вовсе.
+# (`pydantic-core==2.50.1`), и набор с другой версией не ставится вовсе.
 # Двигается только вместе с `pydantic` выше.
-pydantic-core==2.46.5
+pydantic-core==2.50.1
 Pygments==2.21.0
 python-dotenv==1.2.4
 shellingham==1.5.4
