@@ -2,6 +2,24 @@
 
 Значимые изменения кода и поведения. Статус работ — в [TASKS.md](TASKS.md).
 
+## 2026-11-01 — обновления Dependabot (#12–#17)
+
+### Изменено
+
+- Actions: `setup-python` 7.1.0, `download-artifact` 8.0.2, `upload-artifact`
+  7.0.2 (без ломающих изменений).
+- `packaging/constraints.txt`: 27 пакетов из группы Dependabot (fastapi 0.162.0,
+  pydantic 2.14.1, starlette 1.10.0, multidict 7.2.1 и др.). Поправлено руками:
+  `maxapi-python` оставлен на 2.4.1 (pyproject держит `<2.5`, минор меняет
+  протокол — поднимать отдельно с прогоном `tests/test_transport_ws.py`);
+  `pydantic-core` 2.50.1 под pydantic 2.14.1; добавлен `opentelemetry-api`
+  1.45.2 — новая транзитивная fastapi 0.162.
+- Базовые образы. Заголовки squash-коммитов #12/#13 врут: digest-ы Dependabot
+  указывали на другие теги (`f17ec84` — Python 3.15.2, `2dc419c` —
+  `debian:trixie` не slim), потому что в `FROM` нет тега. В ветках заменены на
+  текущие `python:3.14-slim` `cd89c30e…` (3.14.10) и `debian:trixie-slim`
+  `f6b08b09…`, `DEBIAN_SNAPSHOT=20261027T000000Z`.
+
 ## 2026-10-05 — базовый образ на Python 3.14.8
 
 ### Изменено
