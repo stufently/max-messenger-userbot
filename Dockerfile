@@ -3,9 +3,12 @@
 # через полгода дала бы другой интерпретатор и другой набор системных библиотек.
 # Digest снят с фактически скачанного образа (`docker buildx imagetools inspect`)
 # и указывает на манифест-список, то есть остаётся верным и на amd64, и на arm64.
-# Тег рядом — чтобы при обновлении было видно, что именно закреплено.
-FROM python@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
-# python:3.14-slim (3.14.10)
+# Тег стоит в той же строке: Docker при `тег@digest` берёт образ строго по
+# digest, а тег нужен Dependabot — без него тот угадывал тег по digest и
+# предлагал образы чужих тегов (Python 3.15 вместо 3.14-slim). Минор из тега
+# сверяет job `versions` в ci.yml.
+FROM python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+# Python 3.14.10 на момент закрепления.
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

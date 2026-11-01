@@ -449,7 +449,7 @@ jobs:
           # версию»: иначе проверка нашла бы номер в соседнем комментарии и
           # сравнивала бы текст сама с собой.
           winfile=packaging/windows/Dockerfile
-          image_minor="$(sed -n 's/^# python:\([0-9]\+\.[0-9]\+\)-slim.*$/\1/p' Dockerfile)"
+          image_minor="$(sed -n 's/^FROM python:\([0-9]\+\.[0-9]\+\)-slim@sha256:[0-9a-f]\{64\}$/\1/p' Dockerfile)"
           exe_version="$(sed -n 's/^ARG PYTHON_VERSION=\([0-9]\+\.[0-9]\+\.[0-9]\+\)$/\1/p' "$winfile")"
           exe_dir="$(sed -n 's/^ARG PYTHON_DIR="C:\\\\Python\([0-9]\+\)"$/\1/p' "$winfile")"
           runner_version="$(sed -n 's/^ *python-version: "\([0-9.]\+\)"$/\1/p' .github/workflows/windows-build.yml)"
@@ -534,7 +534,7 @@ jobs:
         run: |
           set -euo pipefail
           dockerfile=packaging/windows/Dockerfile
-          mapfile -t images < <(sed -n 's/^FROM \(debian@sha256:[0-9a-f]\{64\}\)$/\1/p' "$dockerfile")
+          mapfile -t images < <(sed -n 's/^FROM \(debian:[a-z0-9][a-z0-9._-]*@sha256:[0-9a-f]\{64\}\)$/\1/p' "$dockerfile")
           # Дата снимка разбирается по форме, а не «всё после знака равенства»:
           # иначе пустое или битое значение прошло бы дальше и попало в шаблон
           # поиска, где часть символов значит не себя.
@@ -542,7 +542,7 @@ jobs:
           # Ноль совпадений означал бы, что проверка молча перестала проверять,
           # а несколько — что она сверяет не то, что попадёт в сборку.
           if [ "${#images[@]}" -ne 1 ] || [ "${#snapshots[@]}" -ne 1 ]; then
-            echo "в $dockerfile ожидались ровно один FROM debian@sha256: и один ARG DEBIAN_SNAPSHOT," >&2
+            echo "в $dockerfile ожидались ровно один FROM debian:<тег>@sha256:<digest> и один ARG DEBIAN_SNAPSHOT," >&2
             echo "найдено: образов ${#images[@]}, снимков ${#snapshots[@]}" >&2
             exit 1
           fi
